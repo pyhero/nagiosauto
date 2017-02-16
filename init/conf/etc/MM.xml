@@ -1,0 +1,5 @@
+<config>
+  <device ip="">
+    <service name="snmpd" authkey="" privkey="" version="3" />
+  </device>
+</config>

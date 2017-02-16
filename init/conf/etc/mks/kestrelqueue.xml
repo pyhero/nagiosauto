@@ -1,0 +1,5 @@
+<config>
+
+<device ip="127.0.0.1" port="22133" warn-async_queue_sendmailqueue-item-counts="40" crit-async_queue_sendmailqueue-item-counts="50" />
+
+</config>

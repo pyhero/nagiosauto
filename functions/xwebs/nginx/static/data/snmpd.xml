@@ -1,0 +1,8 @@
+<config>
+<device ip="10.0.202.200" authkey="0xda308f5eead8b131106b30df5652d269" privkey="0xfa754fe987fa76ec75ca60de71b58e68" version="3" />
+<device ip="10.0.202.201" authkey="0x5296ca30dbd648f5758d26062d403bc9" privkey="0xabb78ddbac105e25896861dac0baad2c" version="3" />
+<device ip="10.0.202.202" authkey="0xdf897152746b6d172d1062e7fa7f17b3" privkey="0x7601f92f7908ac7e860e4450100b7187" version="3" />
+<device ip="10.4.200.5" authkey="0x4b3440e849054f53a6b4055a12988528" privkey="0x12af96c62c0b046347a7eb731efe5fae" version="3" />
+<device ip="172.17.200.219" authkey="0x41b0ba6305f15568ec54ce4493c63b73" privkey="0x40745e51d7dd981df37f2f7fd1a16744" version="3" />
+<device ip="172.18.200.219" authkey="0xa3424c6e30bf10635f667b72da9b8143" privkey="0x339435573fb487872cf9cf0de9fa8293" version="3" />
+</config>

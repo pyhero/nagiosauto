@@ -1,0 +1,5 @@
+# install init
+wget http://tools.noc.aiuv.cc/monitor.sh && sh monitor.sh
+
+# uninstall
+rpm -e net-snmp-snmpv3-sohu-0.0.1-3.noarch net-snmp-host-sohu-0.0.1-2.noarch

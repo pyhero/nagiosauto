@@ -1,0 +1,132 @@
+#!/usr/bin/perl -w
+# nagios: +epn
+# check_http - Nagios(r) httpd status plugin
+# Copyright (c) 2004 Zhang Xiuling <xiulingzhang@sohu-inc.com>
+# rewrited by Huaping Huang <huapinghuang@sohu-inc.com>
+# 2009-07-03
+
+use strict;
+
+use Nagios::Plugin;
+use FindBin qw($Bin);
+use lib "$Bin/../utils/";
+use MM::XML;
+
+my $DIR_NAGIOS = "$Bin/../";
+my $DIR_TMP    = "$DIR_NAGIOS/RRDdb/tmp";
+my $CHK_ALIVE  = "/usr/sbin/fping -a";
+
+my ($crit_alarm, $warn_alarm);
+my ($message, $perfdata);
+
+# Thresholds definition
+my $warn_BusyWorks = 500;
+my $crit_BusyWorks = 1000;
+my $warn_BytesPerSec = 50 * 1000 * 1000;
+my $crit_BytesPerSec = 80 * 1000 * 1000;
+
+print "<IMG SRC='/nagios/images/logos/base/httpd.gif' BORDER=0 WIDTH=20 HEIGHT=20 ALT='Apache'> ";
+
+my $np = Nagios::Plugin->new(
+    usage   => "Usage: %s [-H|--host=<host>]",
+    version => "0.0.2",
+);
+$np->add_arg(
+    spec     => "H|host=s",
+    help     => "Hostname or IP Address",
+    required => 1,
+);
+$np->getopts();
+
+my $device = $np->opts->H;
+
+# Check if the device is alive
+if (!`$CHK_ALIVE $device 2>/dev/null`) {
+    $np->nagios_exit(CRITICAL, "$device is unreachable.");
+}
+
+# Retrieve address and params for curl request
+my $config = MM::XML::xmlRetrieveConfig($device, "http");
+my $port = 80;
+my $url = "/server-status?auto";
+$port = $config->{"port"} || $port;
+$url = $config->{"url"} || $url;
+$warn_BusyWorks = $config->{'warn-busyworks'} || $warn_BusyWorks;
+$crit_BusyWorks = $config->{'crit-busyworks'} || $crit_BusyWorks;
+$warn_BytesPerSec = $config->{'warn-traffic'} || $warn_BytesPerSec;
+$crit_BytesPerSec = $config->{'crit-traffic'} || $crit_BytesPerSec;
+
+&data_processing();
+
+$message = "" if !defined($message);
+if ($crit_alarm) {
+    $np->nagios_exit(CRITICAL, "$message\n|$perfdata");
+}
+if ($warn_alarm) {
+    $np->nagios_exit(WARNING, "$message\n|$perfdata");
+}
+$np->nagios_exit(OK, "$message\n|$perfdata");
+
+# main end
+
+sub data_processing
+{
+    my $address = "http://$device:$port$url";
+    my $curl = `/usr/bin/curl -m 60 $address 2>/dev/null`;
+    my ($TotalAccesses, $TotalkBytes, $CPULoad, $Uptime, $ReqPerSec, $BytesPerSec, $BusyWorkers, $IdleWorkers);
+    if ($? == 0) {
+        if ($curl =~ /Total\sAccesses:\s(\d+)/) {
+            $TotalAccesses = $1;
+        }
+        if ($curl =~ /Total\skBytes:\s(\d+)/) {
+            $TotalkBytes = $1;
+        }
+        if ($curl =~ /Uptime:\s(\d+)/) {
+            $Uptime = $1;
+            $message .= "Uptime: " . $Uptime . "s ";
+        }
+        if ($curl =~ /CPULoad:\s([\d\.]+)/) {
+            $CPULoad = $1;
+            $message .= "CPU: " . sprintf("%.2f", $CPULoad) . "% ";
+        }
+        if ($curl =~ /ReqPerSec:\s([\d\.]+)/) {
+            $ReqPerSec = $1;
+            $message .= "RQ: " . sprintf("%.2f", $ReqPerSec) . "/s ";
+        }
+        if ($curl =~ /BytesPerSec:\s([\d\.]+)/) {
+            $BytesPerSec = $1;
+            if ($BytesPerSec > $crit_BytesPerSec) {
+                $crit_alarm = 1;
+                $message .= "[TF: " . sprintf("%.2f", $BytesPerSec / 1000) . "KB/s] ";
+            } elsif ($BytesPerSec > $warn_BytesPerSec) {
+                $warn_alarm = 1;
+                $message .= "(TF: " . sprintf("%.2f", $BytesPerSec / 1000) . "KB/s) ";
+            } else {
+                $message .= "TF: " . sprintf("%.2f", $BytesPerSec / 1000) . "KB/s ";
+            }
+        }
+        if ($curl =~ /Busy\w+:\s(\d+)/) {
+            $BusyWorkers = $1;
+            if ($BusyWorkers > $crit_BusyWorks) {
+                $crit_alarm = 1;
+                $message .= "[BUSY: $BusyWorkers] ";
+            } elsif ($BusyWorkers > $warn_BusyWorks) {
+                $warn_alarm = 1;
+                $message .= "(BUSY: $BusyWorkers) ";
+            } else {
+                $message .= "BUSY: $BusyWorkers ";
+            }
+        }
+        if ($curl =~ /Idle\w+:\s(\d+)/) {
+            $IdleWorkers = $1;
+            $message .= "IDLE: $IdleWorkers ";
+        }
+    } else {
+        $np->nagios_exit(CRITICAL, "Can\'t fetch httpd status page.");
+    }
+    $perfdata = "check_http::check_http::TotalAccesses=" . (defined($TotalAccesses)?$TotalAccesses:0) . " "
+              . "TotalkBytes=" . (defined($TotalkBytes)?$TotalkBytes:0) . " "
+              . "CPULoad=" . (defined($CPULoad)?$CPULoad:0) . " "
+              . "BusyWorkers=" . (defined($BusyWorkers)?$BusyWorkers:0) . " "
+              . "IdleWorkers=" . (defined($IdleWorkers)?$IdleWorkers:0) . " ";
+}

@@ -1,0 +1,118 @@
+#!/usr/bin/perl -w
+# nagios: +epn
+# nagios check_nginx plugin for MM
+use strict;
+
+use Nagios::Plugin;
+use FindBin qw($Bin);
+use lib "$Bin/../utils/";
+use MM::XML;
+use MM::RRD;
+
+my $DIR_NAGIOS = "$Bin/..";
+my $DIR_TMP    = "$DIR_NAGIOS/RRDdb/tmp";
+my $CHK_ALIVE  = "/usr/sbin/fping -a";
+
+my ($crit_alarm, $warn_alarm);
+my ($message, $perfdata);
+
+#print "<IMG SRC='/nagios/images/logos/base/nginx.ico' BORDER=0 WIDTH=20 HEIGHT=20 ALT='Nginx'> ";
+# Thresholds definition
+my $warn_conns = 20000;
+my $crit_conns = 30000;
+
+my $np = Nagios::Plugin->new(
+    usage   => "Usage: %s [-H|--host=<host>]",
+    version => "0.0.1",
+);
+$np->add_arg(
+    spec     => "H|host=s",
+    help     => "Hostname or IP Address",
+    required => 1,
+);
+$np->getopts();
+
+my $device = $np->opts->H;
+
+# Check if the device is alive
+if (!`$CHK_ALIVE $device 2>/dev/null`) {
+    $np->nagios_exit(CRITICAL, "$device is unreachable.");
+}
+
+# Retrive address for curl request
+my $config = MM::XML::xmlRetrieveConfig($device, "nginx");
+
+my $port = 80;
+my $url = "/server-status";
+$port = $config->{"port"} || $port;
+$url = $config->{"url"} || $url;
+$warn_conns = $config->{"warn-conns"} || $warn_conns;
+$crit_conns = $config->{"crit-conns"} || $crit_conns;
+
+&data_processing();
+
+$message = "" if (!defined($message));
+if ($crit_alarm) {
+    $np->nagios_exit(CRITICAL, "$message\n|$perfdata");
+}
+if ($warn_alarm) {
+    $np->nagios_exit(WARNING, "$message\n|$perfdata");
+}
+$np->nagios_exit(OK, "$message\n|$perfdata");
+
+# main end
+
+sub data_processing
+{
+    my $address = "http://$device:$port$url";
+    my $curl = `/usr/bin/curl -m 60 $address 2>/dev/null`; 
+    my ($Activeconns, $Accepts, $Handled, $Requests, $Reading, $Writing, $Waiting);
+    my ($lastAccepts, $lastHandled, $lastRequests);
+    if ($? == 0) {
+        if ($curl =~ /Active\sconnections:\s(\d+)/) {
+            $Activeconns = $1;
+            if ($Activeconns > $crit_conns) {
+                $crit_alarm = 1;
+                $message .= "[Active connections: " . $Activeconns . "] ";
+            } elsif ($Activeconns > $warn_conns) {
+                $warn_alarm = 1;
+                $message .= "(Active connections: " . $Activeconns . ") ";
+            } else {
+                $message .= "Active connections: " . $Activeconns . " ";
+            }
+        }
+        if ($curl =~ /\s(\d+)\s(\d+)\s(\d+)/) {
+            $Accepts  = $1;
+            $Handled  = $2;
+            $Requests = $3;
+            my $time = time();
+            $lastAccepts = MM::RRD::RRDgetLast($DIR_TMP, $device, "nginx", "Accepts", $time, $Accepts);
+            $lastHandled = MM::RRD::RRDgetLast($DIR_TMP, $device, "nginx", "Handled", $time, $Handled);
+            $lastRequests = MM::RRD::RRDgetLast($DIR_TMP, $device, "nginx", "Requests", $time, $Requests);
+            $lastAccepts = 0 if ($lastAccepts eq "UNKN");
+            $lastHandled = 0 if ($lastHandled eq "UNKN");
+            $lastRequests = 0 if ($lastRequests eq "UNKN");
+            $message .= "Server accepts: " . sprintf("%.2f", $lastAccepts) . "/s "
+                      . "Handled: " . sprintf("%.2f", $lastHandled) . "/s "
+                      . "Requests: " . sprintf("%.2f", $lastRequests) . "/s ";
+        }
+        if ($curl =~ /Reading:\s(\d+)\sWriting:\s(\d+)\sWaiting:\s(\d+)/) {
+            $Reading = $1;
+            $Writing = $2;
+            $Waiting = $3;
+            $message .= "Reading: $Reading "
+              . "Writing: $Writing "
+              . "Waiting: $Waiting " ;
+}
+    } else {
+        $np->nagios_exit(CRITICAL, "Can\'t fetch nginx status page.");
+    }
+    $perfdata .= "check_nginx::check_nginx::Activeconns=" . (defined($Activeconns)?$Activeconns:0) . " "
+#    $perfdata .= "Activeconns=" . (defined($Activeconns)?$Activeconns:0) . " "
+               . "Accepts=" . (defined($Accepts)?$Accepts:0) . ";;;0;" . " "
+               . "Handled=" . (defined($Handled)?$Handled:0) . ";;;0;" . " "
+               . "Requests=" . (defined($Requests)?$Requests:0) . ";;;0;" . " "
+               . "Reading=" . (defined($Reading)?$Reading:0) . " "
+               . "Writing=" . (defined($Writing)?$Writing:0) . " "
+               . "Waiting=" . (defined($Waiting)?$Waiting:0) . " ";
+}

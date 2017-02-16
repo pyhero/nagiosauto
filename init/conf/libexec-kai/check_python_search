@@ -1,0 +1,8 @@
+#!/bin/sh
+
+curl http://python.dajie.com/status/mem/ -s -o index.html
+#cat index.html
+rm -f index.html
+
+echo "WARNING - 0.04 seconds to connect as mysqlar | connection_time=0.0360s;1;5";
+exit 0

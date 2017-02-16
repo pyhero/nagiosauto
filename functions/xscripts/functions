@@ -1,0 +1,167 @@
+#!/bin/bash
+#
+
+chkdir () {
+	# Need to define var: dir
+	if [ ! -d $dir ];then
+		echo "$dir:not exist!"
+		exit 1
+	fi
+}
+
+chkfile () {
+	# Need to define var: file
+	if [ ! -f $file ];then
+		echo "$file:not exist!"
+		exit 1
+	fi
+}
+
+DIR=$(cd `dirname $0`;echo $PWD)
+modules_dir=$DIR/xmodules
+scripts_dir=$DIR/xscripts
+history_dir=$DIR/xxhistory
+
+nagios_conf_configure_dir="$DIR/../etc"
+nagios_conf_online_dir="/ROOT/server/nagios/etc"
+
+for dir in $modules_dir $scripts_dir $history_dir $nagios_conf_configure_dir $nagios_conf_online_dir;do
+	chkdir
+done
+
+today=$($(which date) "+%Y%m%d")
+failed_list=$history_dir/failed.list.${today}.$(date "+%H%M")
+host_config_module=$modules_dir/127.0.0.1.cfg
+service_config_module=$modules_dir/services.cfg
+group_config_module=$modules_dir/hostgroup.cfg
+notify_group_module=$modules_dir/notify_hostgroup.cfg
+escalations_config_module=$modules_dir/escalations.cfg
+file=$host_confit_module && chkfile
+
+chkping () {
+	# Need to modify var: ip
+	continue_key=0
+	if ! $(which ping) -c 1 -q $ip > /dev/null;then
+		echo "$ip unping" >> $failed_list
+		echo -e "\e[31m$ip\e[0m:      ip address unreachable.\n \
+		Check if \e[31m$ip\e[0m is valid or network is reachable."
+		notify_failed
+		continue_key=1
+		#help
+	fi
+}
+
+ipcalc=$(which ipcalc)
+chkIpInNet () {
+	## All net of idc.
+	allnet="10.0.0.0/8 172.16.0.0/12"
+	## Variable host from other scripts.
+	break_key=0
+	for mynet in $allnet;do
+		if [ $(ipcalc -n $host/${mynet#*/}) == $(ipcalc -n $mynet) ];then
+			break_key=1
+			break
+		fi
+	done
+	if [ $break_key -eq 0 ];then
+		echo -e "\e[31m$host\e[0m not in \e[32m$allnet\e[0m"
+		[ ! -z $ip_file ] && clear_ip_file
+		continue
+	fi
+}
+
+def_location () {
+	ip_net="$scripts_dir/ip.list"
+	[ ! -f $ip_net ] && echo -e "\e[31m$ip_net\e[0m:not exist." && exit 6
+	source $ip_net
+
+	break_key=0
+	for net in $nets;do
+		eval realnet="\$$net"
+		for mynet in $realnet;do
+			if [ $(ipcalc -n $host/${mynet#*/}) == $(ipcalc -n $mynet) ];then
+				location=${net%_net}
+				break_key=1
+				break
+			fi
+		done
+		if [ $break_key -eq 1 ];then
+			break
+		fi
+	done
+	if [ $break_key -eq 0 ];then
+		echo -e "\e[31m$host\e[0m not in \e[32m$nets\e[0m"
+		$(which cat) $ip_net
+		echo "$host notInNet" >> $failed_list
+		clear_ip_file
+		continue
+	fi
+}
+
+update_conf () {
+	## sync to local nagios running dir
+        svn_excluded=$scripts_dir/svn.excluded
+        $(which rsync) -qaz --delete \
+               	--exclude-from="$svn_excluded" \
+               	$nagios_conf_configure_dir/conf $nagios_conf_online_dir/
+
+	## check if every configure is ok
+        nagios="$nagios_conf_online_dir/../bin/nagios"
+        for config in $(ls $nagios_conf_online_dir/conf/*.cfg);do
+		lc=$(echo $config | awk -F'/' '{print $NF}' | sed 's/\..*//')
+                if ! $nagios -v $config > /dev/null;then
+                        echo -e "\e[31m!!!\e[0m $config: \e[31mcheckconfig failed\e[0m."
+			title="! Nagios configtest failed"
+			body="$config: $nagios -v $config"
+                        source $scripts_dir/mail.sh
+                        #exit 2
+		else
+			echo -e "$lc config test: \e[32mok\e[0m"
+                fi
+        done
+
+	## reload local  service & co to svn
+       	/etc/init.d/mks restart > /dev/null && \
+	/etc/init.d/nagios reload > /dev/null
+	cd $DIR/../
+	echo -e "\n\e[32mUpdate to svn \e[0m(http://svn.noc.aiuvinc.com/noc/nagios)\n"
+        $(which svn) ci -m "$today:add new host" > /dev/null
+}
+
+sync_remote () {
+	ip_net="$scripts_dir/ip.list"
+	[ ! -f $ip_net ] && echo -e "\e[31m$ip_net\e[0m:not exist." && exit 6
+	source $ip_net
+
+	for nagios_ser in $nagioses;do
+		echo -ne "sync to \e[36m$nagios_ser\e[0m."
+		eval real_ser="\$$nagios_ser"
+		echo -ne "\e[36m$real_ser\e[0m:"
+		## nagios conf
+        	$(which rsync) -qaz --delete \
+                	--exclude-from="$svn_excluded" \
+                	$nagios_conf_configure_dir/conf $real_ser:$nagios_conf_online_dir/
+		[ $? -ne 0 ] && continue
+		echo -e " \e[32mok\e[0m"
+		## mks keys
+		mks_file=/ROOT/conf/nginx/static/data/snmpd.xml
+        	$(which rsync) -qaz --delete \
+                	--exclude-from="$svn_excluded" \
+			$mks_file $real_ser:$mks_file
+
+		## reload remote service
+		[ -z $port ] && port=22
+		0</dev/null ssh -p $port $real_ser \
+       			/etc/init.d/mks restart > /dev/null
+		0</dev/null ssh -p $port $real_ser \
+			/etc/init.d/nagios restart > /dev/null
+	done
+}
+
+notify_failed () {
+	if [ -s $failed_list ];then
+		title="! Nagios add host Monitor failed!"
+		body="\nSee noc.aiuv.com:$failed_list"
+		source $scripts_dir/mail.sh
+	fi
+}

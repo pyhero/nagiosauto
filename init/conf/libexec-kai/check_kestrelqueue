@@ -1,0 +1,121 @@
+#!/usr/bin/perl -w
+#
+#  A Nagios Plugin to check Kestrel Queue server status.
+#+ Writen by Qingkun LIU <qingkun.liu@dajie-inc.com> 2011-09-06.
+#
+
+use strict;
+
+use IO::Socket::INET;
+use IO::Select;
+
+use Data::Dumper;
+use Nagios::Plugin;
+use FindBin qw($Bin);
+use lib "$Bin/../utils/";
+use MM::XML;
+use MM::RRD;
+
+our $VERSION = "0.0.1";
+
+my $DIR_NAGIOS = "$Bin/..";
+my $DIR_TMP    = "$DIR_NAGIOS/RRDdb/tmp";
+my $CHK_ALIVE  = "/usr/sbin/fping -a";
+
+my $port = 22133;
+my $warning_item_counts = 1000000;
+my $critical_item_counts = 1000000;
+
+my $nagios_plugin = Nagios::Plugin->new(
+        shortname => 'KESTRELQUEUE',
+        usage   => "Usage: %s [-H|--host=<host>]",
+        version => $VERSION,
+);
+
+$nagios_plugin->add_arg(
+        spec     => "H|host=s",
+        help     => "Hostname or IP Address",
+        required => 1,
+);
+
+$nagios_plugin->getopts();
+
+my $device = $nagios_plugin->opts->H;
+
+# Check if the device is alive
+if (!`$CHK_ALIVE $device 2>/dev/null`) {
+        $nagios_plugin->nagios_exit(CRITICAL, "$device is unreachable.");
+}
+
+# Retrive config
+my $config = MM::XML::xmlRetrieveConfig($device, "kestrelqueue");
+
+$port = $config->{"port"} || $port;
+$warning_item_counts = $config->{"warn-item-counts"} || $warning_item_counts;
+$critical_item_counts = $config->{"crit-item-counts"} || $critical_item_counts;
+
+my %stats;
+my $socket = IO::Socket::INET->new(
+                                PeerAddr => "$device",
+                                PeerPort => "$port",
+                                Type => SOCK_STREAM,
+                                Proto => "tcp",
+                                )
+        or $nagios_plugin->nagios_exit(CRITICAL, "Can't connect to $device:$port");
+  
+$socket->send("stats\n",0); 
+$socket->autoflush(1); 
+my $select = IO::Select->new($socket);
+while (my @ready = $select->can_read) {
+        foreach my $fh (@ready) {
+                if ($fh == $socket) {
+                        while (<$fh>) {
+                                if (/^END/) {
+                                        last;
+				} elsif (/^STAT\s+\w+(?:expired|mem|total)_items\s+\d+/) {
+                                } elsif (/^STAT\s+queue_(\w+)_items\s+(\d+)/) {
+                                        $stats{$1}=$2;
+                                }
+                        }
+                $select->remove($fh);
+                }
+        }
+}
+$socket->close() or die "Close Socket failed.$@";
+
+foreach my $queue_name (sort keys %stats){
+	my $item_counts = $stats{$queue_name};
+	if (exists $config->{"warn-$queue_name-item-counts"}) {
+		$warning_item_counts = $config->{"warn-$queue_name-item-counts"};
+	}
+	if (exists $config->{"crit-$queue_name-item-counts"}) {
+		$critical_item_counts = $config->{"crit-$queue_name-item-counts"};
+	}
+	&check_item_counts($nagios_plugin, $queue_name, $item_counts, $warning_item_counts, $critical_item_counts);
+}
+
+$nagios_plugin->nagios_exit($nagios_plugin->check_messages( join => ", " ));
+
+sub check_item_counts {
+        my ($np, $q_name, $i_counts, $warn, $crit) = @_;
+        my $code = $np->check_threshold(
+                check    => $i_counts,
+		warning  => $warn,
+		critical => $crit
+                );
+        my $message = sprintf "#$q_name item counts: $i_counts#";
+        if ($code == WARNING) {
+                $message =~ s/#/[/;
+                $message =~ s/#/]/;
+        } elsif ($code == CRITICAL) { 
+                $message =~ s/#/(/;
+                $message =~ s/#/)/;
+        } else {
+                $message =~ s/#//g;
+        }
+        $np->add_message($code, $message);
+	$np->add_perfdata(
+		label   => $q_name,
+		value   => $i_counts
+	);
+}

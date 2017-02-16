@@ -1,0 +1,7 @@
+#!/bin/bash
+
+CF="/opt/jianhua.xu/vps_info/vps_button/total_clients"
+
+TL=$(cat $CF)
+echo "$TL | totalclients=$TL;;;0"
+exit 0

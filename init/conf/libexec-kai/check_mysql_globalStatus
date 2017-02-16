@@ -1,0 +1,79 @@
+#!/usr/bin/perl -w
+# nagios: +epn
+# check_host_static v 0.0.1 - Nagios(r) check mysql processlist plugin
+#
+# (c) LIKAI <9@kai.li>
+# 2010-6-12 many many changes
+#
+# Copyright (c) 2004 Sun Jiafeng <jiafeng.sun@dajie.com>
+# 2009-12-09 17:45
+# based on sohu script
+
+use strict;
+
+use Nagios::Plugin;
+use FindBin qw($Bin);
+use lib "$Bin/../utils/";
+use MM::SNMP;
+use MM::RRD;
+use MM::XML;
+use DBI;
+use Data::Dumper;
+
+my $DIR_NAGIOS = "$Bin/..";
+my $DIR_TMP    = "$DIR_NAGIOS/RRDdb/tmp";
+
+my ($crit_alarm, $warn_alarm);
+my ($message, $perfdata);
+
+
+my $np = Nagios::Plugin->new(
+    usage   => "Usage: %s [-H|--host=<host>]",
+    version => "0.0.1",
+);
+$np->add_arg(
+    spec     => "H|host=s",
+    help     => "Hostname or IP Address",
+    required => 1,
+);
+$np->getopts();
+
+my $device = $np->opts->H;
+
+# Retrieve user/password for mysql authentication
+my $config = MM::XML::xmlRetrieveConfig($device, "mysql");
+
+my ($user, $password, $port);
+my $multi = $config->{'multi'} || 0 ;
+
+if ($multi) {
+    my $sub = $config->{'sub'};
+    foreach (@$sub) {
+       &parse_config($_);
+       &check_globalStatus;
+    }
+} else {
+    $_ = $config;
+    &parse_config($_);
+    &check_globalStatus;
+}
+
+$np->nagios_exit($np->check_messages( join => "; " ) );
+
+sub parse_config
+{
+    $user = $_->{'user'} || "root";
+    $password = $_->{'password'} || "";
+    $port = $_->{'port'} || 3306;
+}
+
+sub check_globalStatus
+{
+    my $active_counts = 1;
+
+#$np->add_perfdata(
+#        label   => "MySQL_GS_$port" . "::mysql_globalstatus::" . "GlobalStatus" ,
+#        value   => $active_counts ,
+#    );
+}
+

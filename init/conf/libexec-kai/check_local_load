@@ -1,0 +1,95 @@
+#!/usr/bin/perl -w
+#
+# check_local_load v 0.0.1 - Nagios(r) check local load plugin
+#
+# Copyright (c) 2007 Vino Duan <vinoduan@sohu-inc.com>
+# 2008-01-03 12:33
+
+################################# 准备 ####################################
+use strict;
+
+use RRDs;
+use Time::Period;
+use Switch;
+use Data::Dumper;
+my $VERSION = "0.0.1";
+
+$ENV{'PATH'}='';
+$ENV{'BASH_ENV'}='';
+$ENV{'ENV'}='';
+
+# define parameters here
+my $BASE_DIR  = "/opt/sohu/nagios";
+my $CGI_DIR  = "/nagios/cgi-bin";
+my $FPING    = "/usr/sbin/fping";
+my $CFG_DIR  = $BASE_DIR . "/etc";
+my $RRDS_DIR = $BASE_DIR . "/RRDdb/";
+my $url_string = "$CGI_DIR/loadGrapher.cgi" ;
+
+my %STATUS_CODE = (
+    'UNKNOWN'  => '-1',
+    'OK'       => '0',
+    'WARNING'  => '1',
+    'CRITICAL' => '2'
+);
+
+
+my ($crit_alarm, $crit_msg, $warn_alarm, $warn_msg, $good_msg, $result_msg);
+
+###############################  取load    #################################
+
+my $w=`/usr/bin/w|/bin/grep load |/bin/awk -F ":" '{print \$5}'|/bin/awk -F "," '{print \$1,\$2,\$3}'`;
+my @w=split / /, $w;
+
+#############################   开始存储数据  ###################################
+my $update_time = time;
+
+if (  !-e $RRDS_DIR  . "localload"
+    . '.rrd' )
+{
+
+    # create a new RRD if it doesn't exist
+    RRDs::create(
+        $RRDS_DIR  . "localload"
+        . '.rrd',
+        "DS:load1:GAUGE:180:U:U",
+        "DS:load2:GAUGE:180:U:U",
+        "DS:load3:GAUGE:180:U:U",
+        "RRA:AVERAGE:0.5:1:360",
+        "RRA:AVERAGE:0.5:5:288",
+        "RRA:AVERAGE:0.5:30:336",
+        "RRA:AVERAGE:0.5:120:372",
+        "RRA:AVERAGE:0.5:1440:366",
+        "RRA:AVERAGE:0.5:10080:262",
+        "RRA:MAX:0.5:5:288",
+        "RRA:MAX:0.5:30:336",
+        "RRA:MAX:0.5:120:372",
+        "RRA:MAX:0.5:1440:366",
+        "RRA:MAX:0.5:10080:262",
+        "--start=" . ( $update_time - 1 ),
+        "--step=60"
+    );
+    if ( my $error = RRDs::error ) {
+        printf( "ERROR: %s.\n", $error );
+        exit( $STATUS_CODE{"WARNING"} );
+    }
+}
+# update this interface's RRD file
+RRDs::update(
+    $RRDS_DIR . "localload" . '.rrd',
+    $update_time . ":"
+      . $w[1]*100
+      . ":"
+      . $w[3]*100
+      . ":"
+      . $w[5]*100
+);
+if ( my $error = RRDs::error ) {
+    printf( "ERROR: %s.\n", $error );
+    exit( $STATUS_CODE{"WARNING"} );
+}
+
+
+print "<A HREF=\"$url_string\" TARGET=\"_blank\">load 0: $w[1]    load 1: $w[3]    load 2: $w[5]</A>\n";
+
+exit( $STATUS_CODE{"OK"} );

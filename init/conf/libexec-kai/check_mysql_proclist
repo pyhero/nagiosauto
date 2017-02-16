@@ -1,0 +1,256 @@
+#!/usr/bin/perl -w
+# nagios: +epn
+# check_host_static v 0.0.1 - Nagios(r) check mysql processlist plugin
+#
+# (c) LIKAI <9@kai.li>
+# 2010-6-12 many many changes
+#
+# Copyright (c) 2004 Sun Jiafeng <jiafeng.sun@dajie.com>
+# 2009-12-09 17:45
+# based on sohu script
+
+use strict;
+
+use Nagios::Plugin;
+use FindBin qw($Bin);
+use lib "$Bin/../utils/";
+use MM::SNMP;
+use MM::RRD;
+use MM::XML;
+use DBI;
+use Data::Dumper;
+
+my $DIR_NAGIOS = "$Bin/..";
+my $DIR_TMP    = "$DIR_NAGIOS/RRDdb/tmp";
+
+my ($crit_alarm, $warn_alarm);
+my ($message, $perfdata);
+
+# Thresholds definition
+
+my $warn_count = 600;
+my $crit_count = 800;
+
+my $warn_sqltime = 60;
+my $crit_sqltime = 180;
+
+my $slave = "0";
+my $warn_delay = 2;
+my $crit_delay = 500;
+
+my $np = Nagios::Plugin->new(
+    usage   => "Usage: %s [-H|--host=<host>]",
+    version => "0.0.1",
+);
+$np->add_arg(
+    spec     => "H|host=s",
+    help     => "Hostname or IP Address",
+    required => 1,
+);
+$np->getopts();
+
+my $device = $np->opts->H;
+
+# Retrieve user/password for mysql authentication
+my $config = MM::XML::xmlRetrieveConfig($device, "mysql");
+
+my ($user, $password, $port);
+my $multi = $config->{'multi'} || 0 ;
+
+if ($multi) {
+    my $sub = $config->{'sub'};
+    foreach (@$sub) {
+        &parse_config($_);
+        &check_processlist;
+	&check_sql_exec_time;
+	if ($_->{'slave'}) {
+	     &check_replication;
+	}
+    }
+} else {
+    $_ = $config;
+    &parse_config($_);
+    &check_processlist;
+    &check_sql_exec_time;
+    if ($_->{'slave'}) {
+	 &check_replication;
+    }
+}
+
+$np->nagios_exit($np->check_messages( join => "; " ) );
+
+sub parse_config
+{
+    $user = $_->{'user'} || "root";
+    $password = $_->{'password'} || "";
+    $port = $_->{'port'} || 3306;
+    $warn_count = $_->{'warn_count'} || $warn_count;
+    $crit_count = $_->{'crit_count'} || $crit_count;
+    $warn_sqltime = $_->{'warn_sqltime'} || $warn_sqltime;
+    $crit_sqltime = $_->{'crit_sqltime'} || $crit_sqltime;
+    $slave = $_->{'slave'} || $slave;
+    $warn_delay = $_->{'warn_delay'} || $warn_delay;
+    $crit_delay = $_->{'crit_delay'} || $crit_delay;
+}
+
+sub check_processlist
+{
+    my $active_counts = -1;
+    my $sleep_counts = -1;
+    my $process_status;
+    my $dsn = "DBI:mysql:information_schema;host=$device;port=$port;mysql_connect_timeout=10;";
+    my $dbh = DBI->connect($dsn, $user, $password, {'PrintError' => 0});
+
+    if (!$dbh) {
+        $np->add_message( 'CRITICAL', "[$port " . $DBI::errstr . "]");
+        return;
+    }
+
+    my $sth = $dbh->prepare("SELECT 'active' as status,COUNT(1) AS count FROM PROCESSLIST where COMMAND!='Sleep' union SELECT 'sleep' as status,COUNT(1) AS count FROM PROCESSLIST where COMMAND='Sleep' ");
+    $sth->execute();
+    while (my $ref = $sth->fetchrow_hashref()) {
+	if ($ref->{'status'} eq 'active') {
+		$active_counts = $ref->{'count'};
+	} elsif ($ref->{'status'} eq 'sleep') {
+		$sleep_counts = $ref->{'count'};
+	}
+    }
+    $sth->finish();
+
+    $dbh->disconnect();
+
+    my $code = $np->check_threshold(
+        check    => $active_counts,
+        warning  => $warn_count,
+        critical => $crit_count
+    );
+    my $message = "#MySQL_$port: process count $active_counts#";
+
+    if ( $code == CRITICAL ) {
+        $message =~ s/#/[/;
+        $message =~ s/#/]/;
+    } elsif ( $code == WARNING ) {
+        $message =~ s/#/(/;
+        $message =~ s/#/)/;
+    } else {
+        $message =~ s/#//g;
+    }
+
+    $np->add_message( $code, $message );
+
+    $np->add_perfdata(
+        label   => "MySQL_$port" . "::mysql_proccount::" . "ActiveCounts" ,
+        value   => $active_counts ,
+    );
+    $np->add_perfdata(
+        label   => "SleepCounts" ,
+        value   => $sleep_counts ,
+    );
+}
+
+sub check_sql_exec_time
+{
+    my $pcounter = 0;
+    my $dsn = "DBI:mysql:information_schema;host=$device;port=$port;mysql_connect_timeout=10;";
+    my $dbh = DBI->connect($dsn, $user, $password, {'PrintError' => 0});
+
+    if (!$dbh) {
+        $np->add_message( 'CRITICAL', "[$port " . $DBI::errstr . "]");
+        return;
+    }
+
+    my $sth = $dbh->prepare("SELECT TIME AS exec_time FROM PROCESSLIST WHERE COMMAND NOT IN ('Sleep','Binlog Dump') AND USER NOT IN ('system user','peter') AND TIME > 10 ORDER BY TIME DESC LIMIT 1");
+    $sth->execute();
+    while (my $ref = $sth->fetchrow_hashref()) {
+        $pcounter = $ref->{'exec_time'};
+    }
+    $sth->finish();
+
+    $dbh->disconnect();
+
+    my $code = $np->check_threshold(
+        check    => $pcounter,
+        warning  => $warn_sqltime,
+        critical => $crit_sqltime
+    );
+    my $message = "#MySQL_$port: sqltime $pcounter#";
+
+    if ( $code == CRITICAL ) {
+        $message =~ s/#/[/;
+        $message =~ s/#/]/;
+    } elsif ( $code == WARNING ) {
+        $message =~ s/#/(/;
+        $message =~ s/#/)/;
+    } else {
+        $message =~ s/#//g;
+    }
+
+    $np->add_message( $code, $message );
+
+#    $np->add_perfdata(
+#        label   => "MySQL_$port" . "::sqltime::" . "exec_time",
+#        value   => $pcounter,
+#    );
+}
+
+sub check_replication
+{
+    my $pcounter = -1;
+    my ($slave_status, $slave_message);
+
+    my $dsn = "DBI:mysql:information_schema;host=$device;port=$port;mysql_connect_timeout=10;";
+    my $dbh = DBI->connect($dsn, $user, $password, {'PrintError' => 0});
+
+    if (!$dbh) {
+        $np->add_message( 'CRITICAL', "[$port " . $DBI::errstr . "]");
+        return;
+    }
+
+    my $sth = $dbh->prepare("show slave status");
+    $sth->execute();
+
+    my $result = $sth->fetchrow_hashref();
+
+    if (( $result->{'Slave_IO_Running'} eq "Yes" ) && ( $result->{'Slave_SQL_Running'} eq "Yes" )) {
+	  $pcounter = $result->{'Seconds_Behind_Master'};
+	  $slave_status = $result->{'Seconds_Behind_Master'};
+	  $slave_message = "#MySQL_$port: Slave Seconds_Behind_Master $slave_status#";
+    } elsif ( $result->{'Last_Errno'} == 0 ) {
+	      $pcounter = -1;
+	      $slave_status = "Stop";
+	      $slave_message = "#MySQL_$port: Slave $slave_status#";
+    } else {
+	      $pcounter = -1;
+	      $slave_status = $result->{'Last_Errno'};
+	      $slave_message = "#MySQL_$port: Slave Error $slave_status#";
+    }
+
+    $sth->finish();
+    $dbh->disconnect();
+
+    my $code = $np->check_threshold(
+        check    => $pcounter,
+        warning  => $warn_delay,
+        critical => $crit_delay
+    );
+
+    my $message = $slave_message;
+
+    if ( $code == CRITICAL ) {
+        $message =~ s/#/[/;
+        $message =~ s/#/]/;
+    } elsif ( $code == WARNING ) {
+        $message =~ s/#/(/;
+        $message =~ s/#/)/;
+    } else {
+        $message =~ s/#//g;
+    }
+
+    $np->add_message( $code, $message );
+
+#    $np->add_perfdata(
+#        label   => "MySQL_$port" . "::Slave Seconds_Behind_Master::" . "delay_time",
+#        value   => $pcounter,
+#    );
+}
+

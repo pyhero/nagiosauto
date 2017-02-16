@@ -1,0 +1,78 @@
+#!/usr/bin/perl -w
+# nagios: +epn
+# nagios check_content plugin for MM
+# Version 0.1, 2010-6-9
+# by <9@kai.li>
+use strict;
+
+use Data::Dumper;
+use Nagios::Plugin;
+use FindBin qw($Bin);
+use lib "$Bin/../utils/";
+use MM::XML;
+
+our $VERSION = "0.1";
+
+my $DIR_NAGIOS = "$Bin/..";
+my $DIR_TMP    = "$DIR_NAGIOS/RRDdb/tmp";
+my $CHK_ALIVE  = "/usr/sbin/fping -a";
+
+my ($message, $perfdata);
+
+my $np = Nagios::Plugin->new(
+    shortname => 'CONTENT',
+    usage   => "Usage: %s [-H|--host=<host>]",
+    version => $VERSION,
+);
+$np->add_arg(
+    spec     => "H|host=s",
+    help     => "Hostname or IP Address",
+    required => 1,
+);
+$np->getopts();
+
+my $device = $np->opts->H;
+
+# Check if the device is alive
+#if (!`$CHK_ALIVE $device 2>/dev/null`) {
+#    $np->nagios_exit(CRITICAL, "$device is unreachable.");
+#}
+
+# Retrive config
+my $config = MM::XML::xmlRetrieveConfig($device, "content");
+
+my $schema = $config->{"schema"} || "http";
+my $port = $config->{"port"} || "";
+my $path = $config->{"path"} || "/";
+
+if ($port) {
+    $port = ":" . $port;
+}
+
+&data_processing();
+
+$np->nagios_exit($np->check_messages());
+
+sub data_processing
+{
+    my $address = "$schema://$device$port$path";
+    my ($timestamp, $status, $message);
+    my $curl = `/usr/bin/curl -m 30 $address 2>/dev/null`;
+
+    if ($? == 0) {
+        if ($curl =~ /^(\d+)\s+(OK|CRITICAL)\s+(.*)$/) {
+            ($timestamp, $status, $message) = ($1, $2, $3);
+            my $now = time();
+            my $delay = $now - $timestamp;
+            if ($now - $timestamp > 800) {
+                $np->add_message(CRITICAL, "[Status page not updated for $delay sec]");
+            } else {
+		    $np->add_message($status, $message);
+            }
+        } else {
+            $np->add_message(WARNING, "(Invalid status page fetched)");
+        }
+    } else {
+        $np->add_message(CRITICAL, "[Can\'t fetch web status page $address]");
+    }
+}

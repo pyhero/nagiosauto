@@ -1,0 +1,193 @@
+#!/usr/bin/perl -w
+# nagios: +epn
+# nagios check_memcached plugin for MM
+# by <9@kai.li>
+use strict;
+
+use Data::Dumper;
+use Nagios::Plugin;
+use FindBin qw($Bin);
+use lib "$Bin/../utils/";
+use MM::XML;
+use MM::RRD;
+
+use Cache::Memcached;
+
+our $VERSION = "0.0.1";
+
+my $DIR_NAGIOS = "$Bin/..";
+my $DIR_TMP    = "$DIR_NAGIOS/RRDdb/tmp";
+my $CHK_ALIVE  = "/usr/sbin/fping -a";
+
+my ($crit_alarm, $warn_alarm);
+my ($message, $perfdata);
+
+# Thresholds definition
+my $warn_conns = 20000;
+my $crit_conns = 30000;
+
+# usage
+my $warn_use = 93;
+my $crit_use = 97;
+# hit ratio
+my $warn_hit = 80;
+my $crit_hit = 20;
+
+my $np = Nagios::Plugin->new(
+    shortname => 'MEMCACHED',
+    usage   => "Usage: %s [-H|--host=<host>]",
+    version => $VERSION,
+);
+$np->add_arg(
+    spec     => "H|host=s",
+    help     => "Hostname or IP Address",
+    required => 1,
+);
+$np->getopts();
+
+my $device = $np->opts->H;
+
+# Check if the device is alive
+if (!`$CHK_ALIVE $device 2>/dev/null`) {
+    $np->nagios_exit(CRITICAL, "$device is unreachable.");
+}
+
+# Retrive config
+my $config = MM::XML::xmlRetrieveConfig($device, "memcached");
+
+my $port = 11211;
+$port = $config->{"port"} || $port;
+#$warn_conns = $config->{"warn-conns"} || $warn_conns;
+#$crit_conns = $config->{"crit-conns"} || $crit_conns;
+
+my $host = "$device:$port";
+
+my $memd = new Cache::Memcached { 'servers' => [ $host ] };
+$memd->set_cb_connect_fail(
+    sub {
+        my $prefip = shift;
+        $np->nagios_exit(CRITICAL, "Can't connect to $prefip");
+    }
+);
+
+my $stats = $memd->stats( [qw/misc/] );
+
+my $misc = $stats->{hosts}->{$host}->{misc};
+
+&check_size( $np, $misc, $warn_use, $crit_use);
+&check_hit( $np, $misc, $warn_hit, $crit_hit);
+&check_conn( $np, $misc);
+
+$np->nagios_exit( $np->check_messages( join => ", " ) );
+
+sub check_size {
+    my ( $np, $misc, $warn, $crit ) = @_;
+
+    my $use_size = $misc->{bytes} * 100 / $misc->{limit_maxbytes};
+
+    my $code = $np->check_threshold(
+        check    => $use_size,
+        warning  => $warn,
+        critical => $crit
+    );
+
+    my $message = sprintf( "#Bytes Usage: %.2f%%#", $use_size );
+
+    if ( $code == CRITICAL ) {
+        $message =~ s/#/[/;
+        $message =~ s/#/]/;
+    } elsif ( $code == WARNING ) {
+        $message =~ s/#/(/;
+        $message =~ s/#/)/;
+    } else {
+        $message =~ s/#//g;
+    }
+    $np->add_message( $code, $message );
+
+    $np->add_perfdata(
+        label   => 'bytes',
+        value   => $misc->{bytes},
+    );
+
+    $np->add_perfdata(
+        label   => 'limit_maxbytes',
+        value   => $misc->{limit_maxbytes},
+    );
+}
+
+sub check_hit {
+    my ( $np, $misc, $warn, $crit ) = @_;
+
+    my ( $cmd_get, $get_hits );
+    my ( $last_cmd_get, $last_get_hits );
+
+    $cmd_get  = $misc->{cmd_get};
+    $get_hits = $misc->{get_hits};
+
+    my $time = time();
+    $last_cmd_get = MM::RRD::RRDgetLast($DIR_TMP, $device, "memcached", "cmd_get", $time, $cmd_get);
+    $last_get_hits = MM::RRD::RRDgetLast($DIR_TMP, $device, "memcached", "get_hits", $time, $get_hits);
+
+    if ( $last_get_hits =~ /^[+-]?\d+\.?\d*$/ &&
+         $last_cmd_get =~ /^[+-]?\d+\.?\d*$/ ) {
+        my $hit_ratio;
+	if ( $last_cmd_get == 0) {
+            $hit_ratio = 100;
+        } else {
+            $hit_ratio = $last_get_hits * 100 / $last_cmd_get;
+        }
+
+        my $code = $np->check_threshold(
+            check    => $hit_ratio,
+            warning  => sprintf('@%d:%d', $crit, $warn),
+            critical => sprintf('@0:%d', $crit)
+        );
+
+	# only raising hit alert when server is 'busy'
+	if ($last_cmd_get < 100) {
+		$code = OK;
+	}
+        my $message = sprintf( "#Hit Ratio: %.2f%%#", $hit_ratio );
+
+        if ( $code == CRITICAL ) {
+            $message =~ s/#/[/;
+            $message =~ s/#/]/;
+        } elsif ( $code == WARNING ) {
+            $message =~ s/#/(/;
+            $message =~ s/#/)/;
+        } else {
+            $message =~ s/#//g;
+        }
+        $np->add_message( $code, $message );
+    }
+
+    $np->add_perfdata(
+        label   => 'cmd_get',
+        value   => $misc->{cmd_get},
+        uom     => 'c',
+	min     => 0
+    );
+
+    $np->add_perfdata(
+        label   => 'get_hits',
+        value   => $misc->{get_hits},
+        uom     => 'c',
+	min     => 0
+    );
+}
+
+sub check_conn {
+    my ( $np, $misc, $warn, $crit ) = @_;
+
+    $np->add_perfdata(
+        label   => 'curr_connections',
+        value   => $misc->{curr_connections},
+    );
+
+    $np->add_perfdata(
+        label   => 'total_connections',
+        value   => $misc->{total_connections},
+        uom     => 'c',
+	min     => 0
+    );
+}

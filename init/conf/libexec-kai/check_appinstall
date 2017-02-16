@@ -1,0 +1,164 @@
+#!/usr/bin/perl -w
+# nagios: +epn
+# nagios check_appinstall plugin for MM
+# Version 0.1, 2014-8-6
+# (C)2014 Geek-Geek, Co., Ltd.
+# (C)2014 LIKAI <9@kai.li>
+# { e0 -> OK, e1 -> E_DOWNLOAD, e2 -> E_UNZIP, e3 -> E_CONF, e4 -> E_NOAPPENG, other -> E_OTHER, TOTAL}
+use strict;
+
+use Data::Dumper;
+use Nagios::Plugin;
+use FindBin qw($Bin);
+use lib "$Bin/../utils/";
+use MM::RRD;
+use MM::XML;
+use JSON;
+
+our $VERSION = "0.1";
+
+my $DIR_NAGIOS = "$Bin/..";
+my $DIR_TMP    = "$DIR_NAGIOS/RRDdb/tmp";
+my $CHK_ALIVE  = "/usr/sbin/fping -a";
+
+my ($message, $perfdata);
+
+my $np = Nagios::Plugin->new(
+    shortname => 'APPINSTALL',
+    usage   => "Usage: %s [-H|--host=<host>]",
+    version => $VERSION,
+);
+$np->add_arg(
+    spec     => "H|host=s",
+    help     => "Hostname or IP Address",
+    required => 1,
+);
+$np->getopts();
+
+my $device = $np->opts->H;
+
+=head
+# Check if the device is alive
+#if (!`$CHK_ALIVE $device 2>/dev/null`) {
+#    $np->nagios_exit(CRITICAL, "$device is unreachable.");
+#}
+
+# Retrive config
+my $config = MM::XML::xmlRetrieveConfig($device, "content");
+
+my $schema = $config->{"schema"} || "http";
+my $port = $config->{"port"} || "";
+my $path = $config->{"path"} || "/";
+
+if ($port) {
+    $port = ":" . $port;
+}
+=cut
+
+&data_processing();
+
+$np->nagios_exit($np->check_messages());
+
+sub data_processing
+{
+    my $address = "https://app.hiwifi.com/cloud.php?m=statistics&a=getlist&t=ca33473a5cdc28f9d12b8b6feea8ec9a";
+    my ($timestamp, $status, $message);
+    my $curl_text = `/usr/bin/curl -m 30 '$address' 2>/dev/null`;
+
+    if ($? == 0) {
+	my $data = decode_json $curl_text;
+
+	my $ok 		= $data->{'e0'};
+	my $e_download 	= $data->{'e1'};
+	my $e_unzip 	= $data->{'e2'};
+	my $e_conf 	= $data->{'e3'};
+	my $e_noappeng 	= $data->{'e4'};
+	my $e_other 	= $data->{'other'};
+	my $total 	= $data->{'total'};
+
+	my $time        = time();
+	my $last_ok = MM::RRD::RRDgetLast($DIR_TMP, $device, "Appinstall", "ok", $time, $ok);
+	$last_ok = 0 if ($last_ok eq "UNKN");
+	$last_ok = sprintf("%.0f", $last_ok * 60);
+
+	my $last_e_download = MM::RRD::RRDgetLast($DIR_TMP, $device, "Appinstall", "e_download", $time, $e_download);
+	$last_e_download = 0 if ($last_e_download eq "UNKN");
+	$last_e_download = sprintf("%.0f", $last_e_download * 60);
+
+	my $last_e_unzip = MM::RRD::RRDgetLast($DIR_TMP, $device, "Appinstall", "e_unzip", $time, $e_unzip);
+	$last_e_unzip = 0 if ($last_e_unzip eq "UNKN");
+	$last_e_unzip = sprintf("%.0f", $last_e_unzip * 60);
+
+	my $last_e_conf = MM::RRD::RRDgetLast($DIR_TMP, $device, "Appinstall", "e_conf", $time, $e_conf);
+	$last_e_conf = 0 if ($last_e_conf eq "UNKN");
+	$last_e_conf = sprintf("%.0f", $last_e_conf * 60);
+
+	my $last_e_noappeng = MM::RRD::RRDgetLast($DIR_TMP, $device, "Appinstall", "e_noappeng", $time, $e_noappeng);
+	$last_e_noappeng = 0 if ($last_e_noappeng eq "UNKN");
+	$last_e_noappeng = sprintf("%.0f", $last_e_noappeng * 60);
+
+	my $last_e_other = MM::RRD::RRDgetLast($DIR_TMP, $device, "Appinstall", "e_other", $time, $e_other);
+	$last_e_other = 0 if ($last_e_other eq "UNKN");
+	$last_e_other = sprintf("%.0f", $last_e_other * 60);
+
+	my $last_total = MM::RRD::RRDgetLast($DIR_TMP, $device, "Appinstall", "total", $time, $total);
+	$last_total = 0 if ($last_total eq "UNKN");
+	$last_total = sprintf("%.0f", $last_total * 60);
+
+        $np->add_message(OK, "OK=$last_ok/m, E_DOWNLOAD=$last_e_download/m, E_UNZIP=$last_e_unzip/m, E_CONF=$last_e_conf/m, E_NOAPPENG=$last_e_noappeng/m, E_OTHER=$last_e_other/m, TOTAL=$last_total/m");
+	$np->add_perfdata(
+		label   => 'OK',
+		value   => $ok,
+		uom => "c"
+	);
+	$np->add_perfdata(
+		label   => 'E_DOWNLOAD',
+		value   => $e_download,
+		uom => "c"
+	);
+	$np->add_perfdata(
+		label   => 'E_UNZIP',
+		value   => $e_unzip,
+		uom => "c"
+	);
+	$np->add_perfdata(
+		label   => 'E_CONF',
+		value   => $e_conf,
+		uom => "c"
+	);
+	$np->add_perfdata(
+		label   => 'E_NOAPPENG',
+		value   => $e_noappeng,
+		uom => "c"
+	);
+	$np->add_perfdata(
+		label   => 'E_OTHER',
+		value   => $e_other,
+		uom => "c"
+	);
+	$np->add_perfdata(
+		label   => 'TOTAL',
+		value   => $total,
+		uom => "c"
+	);
+
+
+	#my $perfdata = "check_appinstall::check_appinstall::OK=" . $ok . "c;;;0; E_DOWNLOAD=" . $e_download . "c;;;0; E_UNZIP=" . $e_unzip . "c;;;0; E_CONF=" . $e_conf . "c;;;0; E_OTHER=" . $e_other . "c;;;0; TOTAL=" . $total . "c;;;0;";
+=head
+        if ($curl =~ /^(\d+)\s+(OK|CRITICAL)\s+(.*)$/) {
+            ($timestamp, $status, $message) = ($1, $2, $3);
+            my $now = time();
+            my $delay = $now - $timestamp;
+            if ($now - $timestamp > 800) {
+                $np->add_message(CRITICAL, "[Status page not updated for $delay sec]");
+            } else {
+		    $np->add_message($status, $message);
+            }
+        } else {
+            $np->add_message(WARNING, "(Invalid status page fetched)");
+        }
+=cut
+    } else {
+        $np->add_message(CRITICAL, "[Can\'t fetch status page $address]");
+    }
+}

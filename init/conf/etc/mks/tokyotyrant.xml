@@ -1,0 +1,8 @@
+<config>
+
+<device ip="10.10.32.132" multi="1">
+        <sub port="9097" />
+        <sub port="9099" />
+</device>
+
+</config>

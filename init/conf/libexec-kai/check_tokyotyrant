@@ -1,0 +1,89 @@
+#!/usr/bin/perl -w
+#
+#  A Nagios Plugin to check Tokyo Tyrant server status.
+#+ Writen by Qingkun LIU <qingkun.liu@dajie-inc.com> 2011-09-14.
+#
+
+use strict;
+
+use IO::Socket::INET;
+use IO::Select;
+
+use Data::Dumper;
+use Nagios::Plugin;
+use FindBin qw($Bin);
+use lib "$Bin/../utils/";
+use MM::XML;
+use MM::RRD;
+
+our $VERSION = "0.0.1";
+
+my $DIR_NAGIOS = "$Bin/..";
+my $DIR_TMP    = "$DIR_NAGIOS/RRDdb/tmp";
+my $CHK_ALIVE  = "/usr/sbin/fping -a";
+
+my $port = 9099;
+
+my $nagios_plugin = Nagios::Plugin->new(
+        shortname => 'TOKYOTYRANT',
+        usage   => "Usage: %s [-H|--host=<host>]",
+        version => $VERSION,
+);
+
+$nagios_plugin->add_arg(
+        spec     => "H|host=s",
+        help     => "Hostname or IP Address",
+        required => 1,
+);
+
+$nagios_plugin->getopts();
+
+my $device = $nagios_plugin->opts->H;
+
+# Check if the device is alive
+if (!`$CHK_ALIVE $device 2>/dev/null`) {
+        $nagios_plugin->nagios_exit(CRITICAL, "$device is unreachable.");
+}
+
+# Retrive config
+my $config = MM::XML::xmlRetrieveConfig($device, "tokyotyrant");
+
+my $multi_process = $config->{"multi"} || 0 ;
+
+if ($multi_process) {
+        my $sub_config = $config->{'sub'};
+        foreach (@$sub_config) {
+                &parse_config($_);
+                &check_status;
+        }
+} else {
+        &parse_config($config);
+        &check_status;
+}
+
+$nagios_plugin->nagios_exit($nagios_plugin->check_messages( join => ", " ));
+
+sub parse_config {
+        $port = $_->{"port"} || $port;
+}
+
+sub check_status {
+        my $socket = IO::Socket::INET->new(
+                                        PeerAddr => "$device",
+                                        PeerPort => "$port",
+                                        Type => SOCK_STREAM,
+                                        Proto => "tcp",
+                                        );
+
+        if ($socket) {
+		print $socket "stats \r\n";
+		if (<$socket>) {
+                	$nagios_plugin->add_message("OK", "$device:$port can be connected");
+			$socket->close() or die "Close Socket failed.$@";
+		} else {
+			$nagios_plugin->add_message("CRITICAL", "[Can't send command to $device:$port]");
+		}
+        } else {
+                $nagios_plugin->add_message("CRITICAL", "[Can't connect to $device:$port]");
+        }
+}

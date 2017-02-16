@@ -1,0 +1,307 @@
+#!/usr/bin/perl -w
+#
+# check_hardware v 0.0.1 - Nagios(r) check host hardware plugin
+#
+# Copyright (c) 2007 Vino Duan <vinoduan@sohu-inc.com>
+# 2007-10-10 12:33
+
+################################# 准备 ####################################
+use strict;
+use Net::SNMP qw(oid_lex_sort oid_base_match snmp_dispatcher);
+use XML::Simple;
+use RRDs;
+use Time::Period;
+use Switch;
+use Data::Dumper;
+my $VERSION = "0.0.1";
+
+$ENV{'PATH'}='';
+$ENV{'BASH_ENV'}='';
+$ENV{'ENV'}='';
+
+# define parameters here
+my $BASE_DIR  = "/opt/sohu/nagios";
+my $CGI_DIR  = "/nagios/cgi-bin";
+my $FPING    = "/usr/sbin/fping";
+my $CFG_DIR  = $BASE_DIR . "/etc";
+my $RRDS_DIR = $BASE_DIR . "/RRDdb/hardware";
+
+my %STATUS_CODE = (
+    'UNKNOWN'  => '-1',
+    'OK'       => '0',
+    'WARNING'  => '1',
+    'CRITICAL' => '2'
+);
+
+
+my ($crit_alarm, $crit_msg, $warn_alarm, $warn_msg, $good_msg, $result_msg);
+
+################################### 取IP ######################################
+
+if ( $#ARGV eq -1 ) { print_usage(); }
+
+
+my $device;
+ARG:
+while ( $ARGV[0] =~ /^-/ ) {
+    if ( $ARGV[0] =~ /^-H|^--host/ ) {
+        $device = $ARGV[1];
+        shift @ARGV;
+        shift @ARGV;
+        next ARG;
+    }
+    print "Unknown flag: $ARGV[0]\n";
+    exit( $STATUS_CODE{"UNKNOWN"} );
+}
+if ( !$device ) {
+    print_usage();
+}
+my $url_string = "$CGI_DIR/hosthwGrapher.cgi?d=$device" ;
+my $url_string_off = "$CGI_DIR/hosthwGrapher.cgi?d=$device" ;
+
+
+
+#################### check if alive###########################################################
+
+
+my $alive = `$FPING -a $device`;
+if ( !$alive ) {
+    print "<A HREF=\"$url_string_off\" TARGET=\"_blank\">ERROR: $device is unreachable.</A>\n";
+    exit( $STATUS_CODE{"CRITICAL"} );
+}
+
+
+################### prepare for snmp ######################################################
+
+# read XML style config file, which contains SNMP settings.
+my $config = XMLin( $CFG_DIR . '/network-devices.xml', KeyAttr => "ip" );
+
+if ( !defined($config) ) {
+    print "<A HREF=\"$url_string_off\" TARGET=\"_blank\">ERROR: Can't open config xml.</A>\n";
+    exit( $STATUS_CODE{"WARNING"} );
+}
+
+if (! $config->{'device'}->{$device}->{'read-community'} && ! $config->{'device'}->{$device}->{'version'} ) {
+    print "<A HREF=\"$url_string_off\" TARGET=\"_blank\">ERROR: no read-community has been found in config xml.</A>\n";
+    exit( $STATUS_CODE{"WARNING"} );
+}
+
+my $timeframe=$config->{'device'}->{$device}->{'ignored-timeframe'};
+
+my ( $session, $error );
+
+# snmpv3 authkey or authpassword
+if ($config->{'device'}->{$device}->{'version'} =~ /3/ ) {
+	my $authkey = ''.$config->{'device'}->{$device}->{'authkey'};
+	my $privkey = $config->{'device'}->{$device}->{'privkey'};
+	$authkey=substr($authkey,2,32);
+	$privkey=substr($privkey,2,32);
+
+	( $session, $error ) = Net::SNMP->session(
+		-hostname  => $device,
+		-username => $config->{'device'}->{$device}->{'username'} || 'nomgmtuser',
+		-version => $config->{'device'}->{$device}->{'version'},
+		-authkey => '0x'.$authkey,
+		#-authpassword  => $config->{'device'}->{$device}->{'authpassword'} || 'sOhU52312',
+		#-authpassword  => 'AUTHVPWD',
+		-authprotocol => 'md5',
+		-privkey      => '0x'.$privkey,
+		#-privpassword  => 'PRIVPWD',
+		-privprotocol => 'des',
+		-nonblocking => 1,
+		-port        => 161,
+		-timeout     => 20,
+        -retries => 20
+	);
+} else {
+	( $session, $error ) = Net::SNMP->session(
+		-hostname  => $device,
+		-community => $config->{'device'}->{$device}->{'read-community'} || 'public',
+		-version => $config->{'device'}->{$device}->{'version'} || 'snmpv2c',
+		-nonblocking => 1,
+		-port        => 161,
+		-timeout     => 25
+	);
+}
+
+################################# prepare oid ###################################
+
+# define hardware/array oid
+my $cpqDaLogDrvEntry			= '.1.3.6.1.4.1.232.3.2.3.1.1';
+
+my $oid_array_cpqDaLogDrvIndex 		= '.1.3.6.1.4.1.232.3.2.3.1.1.2.0';
+my $oid_array_cpqDaLogDrvStatus		= '.1.3.6.1.4.1.232.3.2.3.1.1.4.0';
+my $oid_array_cpqDaLogDrvPhyDrvIDs	= '.1.3.6.1.4.1.232.3.2.3.1.1.10.0';
+my $oid_array_cpqDaLogDrvOsName		= '.1.3.6.1.4.1.232.3.2.3.1.1.14.0';
+
+# define hardware/disk oid
+my $oid_disk_cpqDaPhyDrvIndex		= '.1.3.6.1.4.1.232.3.2.5.1.1.2.0';
+my $oid_disk_cpqDaPhyDrvStatus		= '.1.3.6.1.4.1.232.3.2.5.1.1.6.0';
+
+my @array_columns  		=(
+	'.1.3.6.1.4.1.232.3.2.3.1.1.2.0',	#oid_array_cpqDaLogDrvIndex
+	'.1.3.6.1.4.1.232.3.2.3.1.1.4.0',	#oid_array_cpqDaLogDrvStatus
+	'.1.3.6.1.4.1.232.3.2.3.1.1.10.0',	#oid_array_cpqDaLogDrvPhyDrvIDs
+	'.1.3.6.1.4.1.232.3.2.3.1.1.14.0'	#oid_array_cpqDaLogDrvOsName
+);
+
+my @disk_columns  		=(
+	'.1.3.6.1.4.1.232.3.2.5.1.1.2.0',	#oid_disk_cpqDaPhyDrvIndex
+	'.1.3.6.1.4.1.232.3.2.5.1.1.6.0'	#oid_disk_cpqDaPhyDrvStatus
+);
+
+
+my $result = $session->get_entries(
+    -callback => [ \&array_cb, {} ],
+    -columns  => \@array_columns
+);
+
+snmp_dispatcher();
+
+
+
+#$session->close;
+
+if ( !defined($result) ) {
+    print "<A HREF=\"$url_string_off\" TARGET=\"_blank\">";
+    printf( "ERROR: %s.\n", $session->error );
+    print "</A>\n";
+    $session->close;
+    exit( $STATUS_CODE{"WARNING"} );
+}
+
+
+
+
+$result = $session->get_entries(
+    -callback => [ \&disk_cb, {} ],
+    -columns  => \@disk_columns
+);
+
+
+snmp_dispatcher();
+
+
+
+#$session->close;
+
+if ( !defined($result) ) {
+    print "<A HREF=\"$url_string_off\" TARGET=\"_blank\">";
+    printf( "ERROR: %s.\n", $session->error );
+    print "</A>\n";
+    $session->close;
+    exit( $STATUS_CODE{"WARNING"} );
+}
+
+
+################################## 写出输出至nagios显示页面#########################
+
+if ($crit_alarm) {
+    print "<A HREF=\"$url_string_off\" TARGET=\"_blank\">$result_msg</A>\n";
+    exit( $STATUS_CODE{"WARNING"} );
+}
+
+if ($warn_alarm) {
+    print "<A HREF=\"$url_string\" TARGET=\"_blank\">$result_msg</A>\n";
+    exit( $STATUS_CODE{"WARNING"} );
+}
+
+print "<A HREF=\"$url_string\" TARGET=\"_blank\">$result_msg</A>\n";
+exit( $STATUS_CODE{"OK"} );
+
+
+############################## 子程序 ###############################################
+
+## 子程序--usage
+sub print_usage() {
+    print "Usage: check_hardware -H host\n\n";
+    print "Options:\n";
+    print " -H --host STRING or IPADDRESS\n";
+    print "   Check interface on the indicated host.\n";
+    exit( $STATUS_CODE{"UNKNOWN"} );
+
+}
+
+
+## 子程序--利用snmp取到的数据，对结果进行处理
+sub array_cb {
+
+    my ( $session, $table ) = @_;
+
+
+    if ( !defined( $session->var_bind_list ) ) {
+        printf( "ERROR: %s\n", $session->error );
+        exit( $STATUS_CODE{"WARNING"} );
+    }
+
+    my $tbl_arrayTable = $session->var_bind_list;
+     $result_msg = "HardWare: ";
+    foreach my $oid ( oid_lex_sort( keys( %{$tbl_arrayTable} ) ) ) {
+
+	#输出array的状态
+        if ( oid_base_match( $oid_array_cpqDaLogDrvIndex, $oid ) ) {
+           my $cpqDaLogDrvStatus;
+   	   switch ($tbl_arrayTable->{$oid_array_cpqDaLogDrvStatus.".".$tbl_arrayTable->{$oid}}){
+		case  ""	{$cpqDaLogDrvStatus="new Array"; $warn_alarm=1;}
+		case  "1"	{$cpqDaLogDrvStatus='Unknown'; $warn_alarm=1;}
+		case  "2"	{$cpqDaLogDrvStatus="OK";}
+		case  "3"	{$cpqDaLogDrvStatus="Failed"; $crit_alarm=1;}
+		case  "4"	{$cpqDaLogDrvStatus="Unconfigured";$crit_alarm=1; }
+		case  "5"	{$cpqDaLogDrvStatus="Interim recovery";$crit_alarm=1; }
+		case  "6"	{$cpqDaLogDrvStatus="Ready for rebuild";$crit_alarm=1; }
+		case  "7"	{$cpqDaLogDrvStatus="Rebuilding";$crit_alarm=1; }
+		case  "8"	{$cpqDaLogDrvStatus="Wrong drive";$crit_alarm=1; }
+		case  "9"	{$cpqDaLogDrvStatus="Bad connect";$crit_alarm=1; }
+		case  "10"	{$cpqDaLogDrvStatus="Overheating";$crit_alarm=1; }
+		case  "11"	{$cpqDaLogDrvStatus="Shutdown";$crit_alarm=1; }
+		case  "12"	{$cpqDaLogDrvStatus="Expanding";$crit_alarm=1; }
+		case  "13"	{$cpqDaLogDrvStatus="Not available";$crit_alarm=1; }
+		case  "14"	{$cpqDaLogDrvStatus="Queued for expansion";$crit_alarm=1; }
+  	   }
+		$result_msg .= "Logical Driver ".$tbl_arrayTable->{$oid_array_cpqDaLogDrvIndex.".".$tbl_arrayTable->{$oid}}
+                               ." ".$tbl_arrayTable->{$oid_array_cpqDaLogDrvOsName.".".$tbl_arrayTable->{$oid}}
+                               .": States $cpqDaLogDrvStatus; ";
+        }
+	
+
+    }
+
+
+
+}
+sub disk_cb {
+
+    my ( $session, $table ) = @_;
+
+
+    if ( !defined( $session->var_bind_list ) ) {
+        printf( "ERROR: %s\n", $session->error );
+        exit( $STATUS_CODE{"WARNING"} );
+    }
+
+    my $tbl_diskTable = $session->var_bind_list;
+
+    foreach my $oid ( oid_lex_sort( keys( %{$tbl_diskTable} ) ) ) {
+	#输出disk的状态
+	if ( oid_base_match( $oid_disk_cpqDaPhyDrvIndex, $oid ) ) {
+           my $cpqDaLogphyStatus;
+   	   switch ($tbl_diskTable->{$oid_disk_cpqDaPhyDrvStatus.".".$tbl_diskTable->{$oid}}){
+		case  ""	{$cpqDaLogphyStatus="new Array"; $warn_alarm=1;}
+		case  "1"	{$cpqDaLogphyStatus='Unknown'; $warn_alarm=1;}
+		case  "2"	{$cpqDaLogphyStatus="OK";}
+		case  "3"	{$cpqDaLogphyStatus="Failed"; $crit_alarm=1;}
+		case  "4"	{$cpqDaLogphyStatus="Predictive Failure";$crit_alarm=1; }
+  	   }
+		$result_msg .= "Disk ".$tbl_diskTable->{$oid_disk_cpqDaPhyDrvIndex.".".$tbl_diskTable->{$oid}}
+                               .": States $cpqDaLogphyStatus; ";
+        }
+	
+
+    }
+
+
+
+}
+                                            
+
+

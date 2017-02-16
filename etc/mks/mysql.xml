@@ -1,0 +1,11 @@
+<config>
+
+<device ip="10.22.32.139" multi="1">
+	<sub slave="1" port="3306" user="monitor" password="db_monitor" warn_count="800" crit_count="1500" warn_sqltime="180" crit_sqltime="600" warn_delay="2" crit_delay="100000" />
+	<sub slave="1" port="3308" user="monitor" password="db_monitor" warn_count="800" crit_count="1500" warn_sqltime="180" crit_sqltime="600" warn_delay="2" crit_delay="100000" />
+	<sub slave="0" port="3321" user="monitor" password="db_monitor" warn_count="800" crit_count="1500" warn_sqltime="180" crit_sqltime="600" warn_delay="2" crit_delay="10000" />
+        <sub slave="0" port="3351" user="monitor" password="db_monitor" warn_count="800" crit_count="1500" warn_sqltime="180" crit_sqltime="900" warn_delay="2" crit_delay="10000" />
+</device>
+
+
+</config>

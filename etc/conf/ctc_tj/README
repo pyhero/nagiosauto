@@ -1,0 +1,12 @@
+xhosts:
+	主机定义:
+		每host每文件
+
+xsers:
+	全局定义:
+		命令
+		服务
+		localhost
+	服务应以:
+		所有服务只对组生效
+	hostgroup定义

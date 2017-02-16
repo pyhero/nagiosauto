@@ -1,0 +1,38 @@
+#!/usr/bin/python
+import sys,httplib,urllib,re,time,base64,os
+import pdb;
+# -*- coding: utf-8 -*-
+ST_OK=0
+ST_WR=1
+ST_CR=2
+ST_UK=3
+
+#srv="youku_down"
+host="msg.p2p.ikcd.net"
+
+def check_web(ip,port,srv):
+        try:
+                conn = httplib.HTTPConnection(host+":"+port)
+		headers = {"User-Agent": "iPhone","Host": "msg.p2p.ikcd.net"}
+		url="/srv_mon.php?ip=%s&srv=%s" %(ip,srv)
+                conn.request("GET",url,"",headers)
+                response = conn.getresponse()
+                data = response.read()
+                conn.close()
+        except:
+                print "CRITICAL - can't get web api status";
+                sys.exit(ST_CR);
+        if response.status != 200:
+                print "CRITICAL - web api not return 200";
+                sys.exit(ST_CR);
+	if int(data)<7200:
+		print "OK: delay=%s | 'delay'=%s" %(data,data)
+		sys.exit(ST_OK)
+	else:
+		print "Check daemon: delay=%s | 'delay'=%s" %(data,data)
+		sys.exit(ST_CR)
+
+if __name__ == "__main__":
+	ip=sys.argv[1];
+	srv=sys.argv[2];
+	check_web(ip,'80',srv)

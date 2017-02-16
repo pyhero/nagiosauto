@@ -1,0 +1,30 @@
+<config>
+  <device ip="10.0.202.200">
+    <service name="snmpd" authkey="0xf86f17df3948abca48e3f8d868fe68bf" privkey="0x6c1dd6f0d8026fee89ae519ad99bccfc" version="3" />
+  </device>
+  <device ip="10.0.202.201">
+    <service name="snmpd" authkey="0x1b53fa19e503e9f394c9fb232955dd45" privkey="0xd4490bbd875dc720865069d065db0c79" version="3" />
+  </device>
+  <device ip="10.0.202.202">
+    <service name="snmpd" authkey="0x7f917f1f59ce955fbbd8f9c245c479d7" privkey="0x867af8400d06227c22edfec527d71ce2" version="3" />
+  </device>
+  <device ip="10.10.32.132">
+    <service name="tokyotyrant" multi="1">
+      <sub port="9097" />
+      <sub port="9099" />
+    </service>
+  </device>
+  <device ip="10.22.32.139">
+    <service name="mysql" multi="1">
+      <sub crit_count="1500" crit_delay="100000" crit_sqltime="600" password="db_monitor" port="3306" slave="1" user="monitor" warn_count="800" warn_delay="2" warn_sqltime="180" />
+      <sub crit_count="1500" crit_delay="100000" crit_sqltime="600" password="db_monitor" port="3308" slave="1" user="monitor" warn_count="800" warn_delay="2" warn_sqltime="180" />
+      <sub crit_count="1500" crit_delay="10000" crit_sqltime="600" password="db_monitor" port="3321" slave="0" user="monitor" warn_count="800" warn_delay="2" warn_sqltime="180" />
+      <sub crit_count="1500" crit_delay="10000" crit_sqltime="900" password="db_monitor" port="3351" slave="0" user="monitor" warn_count="800" warn_delay="2" warn_sqltime="180" />
+    </service>
+  </device>
+  <device ip="127.0.0.1">
+    <service name="content" path="/tmp/Web_status.txt" schema="file" />
+    <service name="kestrelqueue" crit-async_queue_sendmailqueue-item-counts="50" port="22133" warn-async_queue_sendmailqueue-item-counts="40" />
+    <service name="snmpd" authkey="0xf86f17df3948abca48e3f8d868fe68bf" privkey="0x6c1dd6f0d8026fee89ae519ad99bccfc" version="3" />
+  </device>
+</config>

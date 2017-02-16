@@ -1,0 +1,232 @@
+#!/usr/bin/perl -w
+# nagios: +epn
+# check_host_csync v 0.0.1 - Nagios(r) check host resource plugin
+#
+# Copyright (c) 2004 Zhang Xiuling <xiulingzhang@sohu-inc.com>
+# modified by vinoduan
+# 2007-05-30
+# add sort
+# 2004-12-02 22:56
+#
+
+use strict;
+use Nagios::Plugin;
+use Net::SNMP qw(oid_lex_sort oid_base_match snmp_dispatcher);
+use XML::Simple;
+use RRDs;
+use Time::Period;
+use Data::Dumper;
+use FindBin qw($Bin);
+use lib "$Bin/../utils/";
+use MM::SNMP;
+use MM::XML;
+
+# define parameters here
+my $BASE_DIR  = "/opt/sohu/nagios";
+my $CGI_DIR  = "/nagios/cgi-bin";
+my $FPING    = "/usr/sbin/fping";
+my $CFG_DIR  = $BASE_DIR . "/etc";
+my $RRDS_DIR = $BASE_DIR . "/RRDdb/csync";
+
+# default limits for warning and critical alarm
+my $warn_limit = 8*60; 
+#my $crit_limit = 8*3600;
+my $crit_limit = 1*3600;
+
+my ($crit_alarm, $warn_alarm, $message, $perfdata);
+
+my $np = Nagios::Plugin->new(
+    usage   => "Usage: %s [-H|--host=host]",
+    version => "0.0.2",
+);
+$np->add_arg(
+    spec     => "H|host=s",
+    help     => "Hostname or IP Address",
+    required => 1,
+);
+$np->getopts();
+
+my $device = $np->opts->H;
+
+my $url_string = "$CGI_DIR/csyncGrapher.cgi?d=$device";
+my $url_string_off = "$CGI_DIR/csyncGrapher-off.cgi?d=$device";
+
+# check if the device is alive
+my $alive = `$FPING -a $device`;
+if ( !$alive ) {
+    $np->nagios_exit(CRITICAL, "<A HREF=\"$url_string_off\" TARGET=\"_blank\">ERROR: $device is unreachable.</A>\n");
+}
+
+# Retrieve authkey/privkey for SNMPv3 authentication
+my $config = MM::XML::xmlRetrieveConfig($device, "snmpd");
+my $authkey = $config->{"authkey"};
+my $privkey = $config->{"privkey"};
+if (!defined($authkey) || !defined($privkey)) {
+    $np->nagios_exit(WARNING, "authkey/privkey not found in config XML.\n");
+}
+
+# Create an SNMP Session
+my ($session, $error) = MM::SNMP::snmpv3CreateSession($device, undef, $authkey, $privkey);
+if (!defined($session)) {
+    $np->nagios_exit(CRITICAL, "session error: $error\n");
+}
+
+#csyncStats
+my $oid_csyncTable      = '.1.3.6.1.4.1.52312.2';
+my $oid_csyncIndex      = '.1.3.6.1.4.1.52312.2.3.1.1';
+my $oid_csyncName       = '.1.3.6.1.4.1.52312.2.3.1.2';
+my $oid_csyncValue      = '.1.3.6.1.4.1.52312.2.3.1.3';
+my $oid_csyncOut        = '.1.3.6.1.4.1.52312.2.3.1.4';
+
+my $res_csync;
+my $stat_csync= MM::SNMP::snmpGetTable($session, \$res_csync, $oid_csyncTable);
+
+if (!defined($stat_csync)) {
+    $error = $session->error();
+    $session->close();
+    $np->nagios_exit(CRITICAL, "<A HREF=\"$url_string_off\" TARGET=\"_blank\"> ERROR2: %s. </A>\n", $error);
+}
+
+snmp_dispatcher();
+
+if (!defined($res_csync)) {
+    $error = $session->error();
+    $session->close();
+    $np->nagios_exit(WARNING, "<A HREF=\"$url_string_off\" TARGET=\"_blank\"> ERROR3: %s </A>\n", $error);
+}
+
+$session->close();
+
+&data_processing();
+
+if ($crit_alarm) {
+#    $np->nagios_exit(CRITICAL, "<A HREF=\"$url_string_off\" TARGET=\"_blank\">$message</A>\n|$perfdata");
+    $np->nagios_exit(CRITICAL, "<A HREF=\"$url_string_off\" TARGET=\"_blank\">$message</A>\n");
+}
+
+if ($warn_alarm) {
+#    $np->nagios_exit(WARNING, "<A HREF=\"$url_string\" TARGET=\"_blank\">$message</A>\n|$perfdata");
+    $np->nagios_exit(WARNING, "<A HREF=\"$url_string\" TARGET=\"_blank\">$message</A>\n");
+}
+
+#$np->nagios_exit(OK, "<A HREF=\"$url_string\" TARGET=\"_blank\">$message</A>\n|$perfdata");
+$np->nagios_exit(OK, "<A HREF=\"$url_string\" TARGET=\"_blank\">$message</A>\n");
+
+### main end
+
+sub data_processing {
+    my $update_time = time();
+
+#++ csync start
+#vinoadd
+    my %result_msg;
+    my %result_msg_warn;
+    my %result_msg_crit;
+
+    #main loop start
+    foreach my $oid (oid_lex_sort(keys(%{$res_csync}))) {
+        if (!oid_base_match($oid_csyncIndex, $oid)) {
+            next;
+        }
+        my $cName = $res_csync->{$oid_csyncName . "." . $res_csync->{$oid}};
+        my $cOut = $res_csync->{$oid_csyncOut . "." . $res_csync->{$oid}};
+        if (defined($cOut)) {
+            if ($cOut > $crit_limit) {
+                if ($cName !~ /cyber/ && $cName !~ /gold/) {
+                    $crit_alarm = 1;
+                }
+                $result_msg_crit{$cName} = $cOut;    
+            } elsif ($cOut > $warn_limit) {
+                if ($cName !~ /cyber/ && $cName !~ /gold/) {
+                    $warn_alarm = 1;
+                }
+                $result_msg_warn{$cName} = $cOut;
+            } else {
+                $result_msg{$cName} = $cOut;
+            }
+        }
+
+        # check if the RRD for this interface is exist
+        if (defined($cName)) {
+            if (!-e $RRDS_DIR . '/' . $device . '_' . $cName . '.rrd') {
+                #1.3.6.1.4.1.2021.10.1.3.1 2 3  1/5/15 load average
+                # create a new RRD if it doesn't exist
+                RRDs::create(
+                    $RRDS_DIR . '/' . $device . '_' . $cName . '.rrd',
+                    "DS:csyncOut:GAUGE:180:0:U",
+                    "RRA:LAST:0.5:1:360",
+                    "RRA:LAST:0.5:5:288",
+                    "RRA:LAST:0.5:30:8640",
+                    "RRA:LAST:0.5:120:372",
+                    "RRA:LAST:0.5:1440:366",
+                    "RRA:LAST:0.5:10080:262",
+                    "--start=" . ( $update_time - 1 ),
+                    "--step=60"
+                );
+                if ( $error = RRDs::error ) {
+                    $np->nagios_exit(WARNING, "ERROR4: $error.\n");
+                }
+            }
+            RRDs::update(
+                $RRDS_DIR . '/' . $device . '_' . $cName . '.rrd',
+                $update_time . ":"
+                . $cOut
+            );
+            if ($error = RRDs::error) {
+                $np->nagios_exit(WARNING, "<A HREF=\"$url_string_off\" TARGET=\"_blank\"> ERROR5: $error.</A>\n");
+            }
+        }
+        # out end
+    }
+    #vinoadd
+    my $Num_result_msg = keys %result_msg;
+    my $Num_result_msg_crit = keys %result_msg_crit;
+    my $Num_result_msg_warn = keys %result_msg_warn;
+    #vinoadd
+    $message  = "CSYNC: ";
+    my $total = $Num_result_msg + $Num_result_msg_crit + $Num_result_msg_warn;
+    my $alert = $total - $Num_result_msg;
+    $message = "$total Channels, $alert Abnormal" . ($alert ? ': ' : '.');
+    $perfdata = "check_host_csync::check_host_csync::total=$total outs=$alert ";
+    if ($Num_result_msg_crit > 0) {
+        foreach my $dut (sort {$result_msg_crit{$b} <=> $result_msg_crit{$a}}
+            keys %result_msg_crit) {
+            $message .= "[";
+            $message .= $dut;
+            $message .= ":";
+            $message .= $result_msg_crit{$dut};
+            $message .= "]";
+            $message .= " ";
+            $perfdata .= $dut . "::csync::out=$result_msg_crit{$dut} ";
+        }
+    }
+    if ($Num_result_msg_warn > 0) {
+        foreach my $dut (sort {$result_msg_warn{$b} <=> $result_msg_warn{$a}}
+            keys %result_msg_warn) {
+            $message .= "(";
+            $message .= $dut;
+            $message .= ":";
+            $message .= $result_msg_warn{$dut};
+            $message .= ")";
+            $message .= " ";
+            $perfdata .= $dut . "::csync::out=$result_msg_warn{$dut} ";
+        }
+    }
+    if ($Num_result_msg > 0) {
+        foreach my $dut (sort {$result_msg{$b} <=> $result_msg{$a}}
+            keys %result_msg) {
+=h
+            $message .= $dut;
+            $message .= ":";
+            $message .= $result_msg{$dut};
+            $message .= " ";
+=cut
+            $perfdata .= $dut . "::csync::out=$result_msg{$dut} ";
+        }
+    }
+
+#main loop end
+}
+
+#-- csync end
+

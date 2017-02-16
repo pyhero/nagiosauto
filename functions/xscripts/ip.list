@@ -1,0 +1,17 @@
+# nagios server ip
+nagioses="cnc_tj_ip ctc_tj_ip bgp_tj_ip jn_ip wh_ip"
+cnc_tj_ip=10.0.202.200
+ctc_tj_ip=10.10.10.100
+bgp_tj_ip=10.4.200.5
+jn_ip=172.18.200.219
+wh_ip=172.17.200.219
+#cnc_bj_ip=
+
+# idc net
+nets="cnc_tj_net ctc_tj_net bgp_tj_net jn_net wh_net"
+cnc_tj_net="10.0.0.0/16 10.15.0.0/16"
+ctc_tj_net="10.10.0.0/16 10.2.0.0/16"
+bgp_tj_net="10.4.0.0/16 10.130.0.0/16 172.28.0.0/16"
+jn_net="172.18.0.0/16 10.18.0.0/16"
+wh_net="172.17.0.0/16 10.17.0.0/16"
+#cnc_bj_net="192.168.0.0/16 172.31.0.0/16"

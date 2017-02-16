@@ -1,0 +1,114 @@
+#!/usr/bin/perl -w
+# nagios: +epn
+# check_lighttpd - Nagios(r) lighttpd status plugin
+#
+# Copyright (c) 2004 Zhang Xiuling <xiulingzhang@sohu-inc.com>
+# Modified by Qin Jianhua <jianhuaqin@sohu-inc.com> (c) 2007
+#
+# rewrited by Huaping Huang <huapinghuang@sohu-inc.com>
+# 2009-07-08
+
+use strict;
+
+use Nagios::Plugin;
+use FindBin qw($Bin);
+use lib "$Bin/../utils/";
+use MM::RRD;
+use MM::XML;
+
+my $DIR_NAGIOS = "$Bin/../";
+my $DIR_TMP    = "$DIR_NAGIOS/RRDdb/tmp";
+my $CHK_ALIVE  = "/usr/sbin/fping -a";
+
+my ($crit_alarm, $warn_alarm);
+my ($message, $perfdata);
+
+# Thresholds definition
+my $warn_busy = 1000;
+my $crit_busy = 1500;
+
+my $np = Nagios::Plugin->new(
+    usage   => "Usage: %s [-H|--host=<host>]",
+    version => "0.0.2",
+);
+$np->add_arg(
+    spec     => "H|host=s",
+    help     => "Hostname or IP Address",
+    required => 1,
+);
+$np->getopts();
+
+my $device = $np->opts->H;
+
+# Check if the device is alive
+if (!`$CHK_ALIVE $device 2>/dev/null`) {
+    $np->nagios_exit(CRITICAL, "$device is unreachable.");
+}
+
+# Retrive address for curl request
+my $config = MM::XML::xmlRetrieveConfig($device, "lighttpd");
+my $port = 80;
+my $url = "/server-status?auto"; 
+$port = $config->{"port"} || $port;
+$url = $config->{"url"} || $url;
+$warn_busy = $config->{'warn-busyworks'} || $warn_busy;
+$crit_busy = $config->{'crit-busyworks'} || $crit_busy;
+
+&data_processing();
+
+$message = "" if !defined($message);
+if ($crit_alarm) {
+    $np->nagios_exit(CRITICAL, "$message\n|$perfdata");
+}
+if ($warn_alarm) {
+    $np->nagios_exit(WARNING, "$message\n|$perfdata");
+}
+$np->nagios_exit(OK, "$message\n|$perfdata");
+
+# main end
+
+sub data_processing
+{
+    my $address = "http://$device:$port$url";
+    my $curl = `/usr/bin/curl -m 60 $address 2>/dev/null`;
+    my ($TotalAccesses, $TotalkBytes, $Uptime, $BusyServers);
+    my ($lastAccesses, $lastkBytes);
+    if ($? == 0) {
+        my $time = time();
+    	if ($curl =~ /Total\sAccesses:\s(\d+)/) {
+            $TotalAccesses = $1;
+            $lastAccesses = MM::RRD::RRDgetLast($DIR_TMP, $device, "lighttpd", "TotalAccesses", $time, $TotalAccesses);
+            $lastAccesses = 0 if ($lastAccesses eq "UNKN");
+            $message .= "RQ: " . sprintf("%.2f", $lastAccesses) . "/s ";
+        }
+    	if ($curl =~ /Total\skBytes: (\d+)/) {
+            $TotalkBytes = $1;
+            $lastkBytes = MM::RRD::RRDgetLast($DIR_TMP, $device, "lighttpd", "TotalkBytes", $time, $TotalkBytes);
+            $lastkBytes = 0 if ($lastkBytes eq "UNKN");
+            $message .= "TF: " . sprintf("%.2f", $lastkBytes) . "KB/s ";
+        }
+    	if ($curl =~ /Uptime:\s(\d+)/) {
+            $Uptime = $1;
+            $message = "Uptime: " . $Uptime . "s " . $message;
+        }
+    	if ($curl =~ /BusyServers:\s(\d+)/) {
+            $BusyServers = $1;
+            if ($BusyServers > $crit_busy) {
+                $crit_alarm = 1;
+                $message .= "[BUSY: $BusyServers] ";
+            } elsif ($BusyServers > $warn_busy) {
+                $warn_alarm = 1;
+                $message .= "(BUSY: $BusyServers) ";
+            } else {
+                $message .= "BUSY: $BusyServers ";
+            }
+        }
+    } else {
+        $np->nagios_exit(CRITICAL, "Can\'t fetch lighttpd status page.");
+    }
+    $message .= "<a target=\"_blank\" href=\"http://$device/server-status\">Details</a>";
+    $perfdata .= "check_lighttpd::check_lighttpd::TotalAccesses=" . (defined($TotalAccesses)?$TotalAccesses:0) . " "
+               . "TotalkBytes=" . (defined($TotalkBytes)?$TotalkBytes:0) . " "
+               . "BusyServers=" . (defined($BusyServers)?$BusyServers:0) . " ";
+}
+

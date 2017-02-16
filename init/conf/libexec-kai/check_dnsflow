@@ -1,0 +1,125 @@
+#!/usr/bin/perl -w
+# nagios: +epn
+# Copyright (c) 2008 Keyn Li <kaili@sohu-inc.com>
+# Nagios Plugin: dnsflow 
+# $Id: check_dnsflow 268 2009-08-02 04:23:45Z huapinghuang $
+#
+
+use strict;
+
+use Nagios::Plugin;
+use Net::SNMP qw(oid_base_match oid_lex_sort snmp_dispatcher);
+use FindBin qw($Bin);
+use lib "$Bin/../utils/";
+use MM::SNMP;
+use MM::RRD;
+use MM::XML;
+
+my $DIR_NAGIOS = "$Bin/..";
+my $DIR_TMP    = "$DIR_NAGIOS/RRDdb/tmp";
+my $CHK_ALIVE  = "/usr/sbin/fping -a";
+
+my ($message, $perfdata);
+
+my $np = Nagios::Plugin->new(
+    usage   => "Usage: %s [-H|--host=<host>]",
+    version => "0.0.1",
+);
+$np->add_arg(
+    spec     => "H|host=s",
+    help     => "Hostname or IP Address",
+    required => 1,
+);
+$np->getopts();
+
+my $device = $np->opts->H;
+
+# Check if the device is alive
+if (!`$CHK_ALIVE $device 2>/dev/null`) {
+    $np->nagios_exit(CRITICAL, "$device is unreachable.");
+}
+
+# Retrieve authkey/privkey for SNMP authentication
+my $config = MM::XML::xmlRetrieveConfig($device, "snmpd");
+
+my $authkey = $config->{"authkey"};
+my $privkey = $config->{"privkey"};
+if (!defined($authkey) || !defined($privkey)) {
+    $np->nagios_exit(WARNING, "authkey/privkey not found in config XML.");
+}
+
+# Create an SNMP Session
+my ($session, $error) = MM::SNMP::snmpv3CreateSession($device, undef, $authkey, $privkey);
+
+if (!defined($session)) {
+    $np->nagios_exit(CRITICAL, $error);
+}
+
+# OID definitions
+my $oid_dnsTable = ".1.3.6.1.4.1.50922";
+my $oid_dnsIndex = ".1.3.6.1.4.1.50922.1";
+my $oid_dnsPort  = ".1.3.6.1.4.1.50922.2";
+my $oid_dnsQuery = ".1.3.6.1.4.1.50922.10";
+my $oid_dnsReply = ".1.3.6.1.4.1.50922.11";
+my $oid_dnsFail  = ".1.3.6.1.4.1.50922.12";
+my $oid_dnsRecur = ".1.3.6.1.4.1.50922.13";
+
+# Get ...
+my $res_dnsTable;
+my $stat_dnsTable = MM::SNMP::snmpGetTable($session, \$res_dnsTable,  $oid_dnsTable);
+
+if (!defined($stat_dnsTable)) {
+    $error = $session->error();
+    $session->close();
+    $np->nagios_exit(CRITICAL, $error);
+}
+snmp_dispatcher();
+if (!defined($res_dnsTable)) {
+    $error = $session->error();
+    $session->close();
+    $np->nagios_exit(CRITICAL, $error);
+}
+$session->close();
+&data_processing();
+
+$np->nagios_exit(OK, "$message\n|$perfdata");
+
+# main end
+
+sub data_processing
+{
+    no strict 'refs';
+    my %data;
+    $data{0} = []; # total flow
+    my @legend = qw(query reply fail recur);
+    my ($query, $reply, $fail, $recur);
+    my %lastQuery;
+    $message = "Queries ";
+    foreach my $oid (oid_lex_sort(keys(%{$res_dnsTable}))) {
+        if (!oid_base_match($oid_dnsIndex, $oid)) {
+            last;
+        }
+        my $port  = $res_dnsTable->{$oid_dnsPort  . "." . $res_dnsTable->{$oid}};
+        our $query = $res_dnsTable->{$oid_dnsQuery . "." . $res_dnsTable->{$oid}};
+        our $reply = $res_dnsTable->{$oid_dnsReply . "." . $res_dnsTable->{$oid}};
+        our $fail  = $res_dnsTable->{$oid_dnsFail  . "." . $res_dnsTable->{$oid}};
+        our $recur = $res_dnsTable->{$oid_dnsRecur . "." . $res_dnsTable->{$oid}};
+        foreach (0..$#legend) {
+            if (!defined(${$legend[$_]})) {
+                $np->nagios_exit(CRITICAL, "Can\'t fetch DNS flow data.");
+            }
+            $data{0}[$_] += ${$legend[$_]};
+            $data{$port}[$_] = ${$legend[$_]};
+        }
+        my $time = time();
+        my $lastQuery = MM::RRD::RRDgetLast($DIR_TMP, $device, "dnsflow" . $port, "dns_query", $time, $query);
+        $lastQuery = 0 if ($lastQuery eq "UNKN");
+        $lastQuery{$port} = $port . "~" . sprintf("%d", $lastQuery);
+    }
+    $message .= join("; ", sort values %lastQuery);
+    foreach my $port (sort keys %data) {
+        my @perf = map{"$legend[$_]=" . $data{$port}[$_]} (0..$#legend);
+        $perfdata .= "DnsFlow_" . $port . "::dnsflow::" . join(" ", @perf) . " ";
+    }
+}
+

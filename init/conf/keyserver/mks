@@ -1,0 +1,89 @@
+#!/usr/bin/perl -w
+# description: MM Key Server
+
+package mks;
+
+use strict;
+
+use XML::Simple;
+use base qw(Net::Server::PreFork);
+use Data::Serializer;
+use File::Basename;
+use Data::Dumper;
+use Getopt::Std;
+use FindBin qw($Bin);
+
+$0 = dirname($0) . '/' . basename($0);
+our ($opt_c, $opt_f, $opt_h, $opt_s, $opt_t, $opt_a, $opt_r);
+getopts('hrc:f:s:t:a:');
+
+if ($opt_h) {
+    print "Usage: $0 [-c conf_file] [-f key_xml_file] [-s squid_xml_file] [-h http_xml_file] [-a all_in_one_xml] [-r]\n";
+    print "                if -r is not implied, -f, -s and -t params are USELESS.\n";
+    exit;
+}
+
+my $conf_file = $opt_c;
+if (!defined($opt_c) || !-e $conf_file) {
+    $conf_file = "$Bin/mks.conf";
+    print "use default conf_file $conf_file\n";
+}
+my $xml = $opt_a;
+if (!defined($opt_a) || !-e $xml) {
+    $xml = "$Bin/../etc/MM.xml";
+    print "use default all-in-one xml $xml\n";
+}
+
+if ($opt_r) {
+    my $config;
+    print "Regenerating all-in-one-xml $xml...\n";
+
+    my @files = <$Bin/../etc/mks/*.xml>;
+    my $service;
+    foreach $xml (@files) {
+        if ($xml =~ /(\w+)\.xml/) {
+            $service = $1;
+            print "Service[$service] found config file $xml \n";
+            
+            my $sconfig = XMLin($xml, KeyAttr => 'ip', ForceArray => 1);
+            die "oops, XML[$xml] can't be loaded\n" if (!defined($sconfig));
+
+            foreach my $device (keys %{$sconfig->{"device"}}) {
+                $config->{"device"}->{$device}->{'service'}->{$service} = $sconfig->{"device"}->{$device};
+            }
+        }
+    }
+
+    # write all-in-one-xml 
+    open XML, ">$xml";
+    print XML XMLout($config, RootName => "config", KeyAttr => {"device" => "ip", "service" => "name"});
+    close XML;
+    print "done.\n";
+}
+my $serializer = Data::Serializer->new();
+die "oops, serializer initialization failed\n" if (!defined($serializer));
+
+my $config = XMLin($xml, KeyAttr => ["name", "ip"], ForceArray => 1);
+foreach my $device (keys %{$config->{"device"}}) {
+    foreach my $service (keys %{$config->{"device"}->{$device}->{"service"}}) {
+        $config->{"device"}->{$device}->{"service"}->{$service} = $serializer->serialize($config->{"device"}->{$device}->{"service"}->{$service});
+    }
+}
+
+my $server = mks->new({conf_file => $conf_file});
+$server->run();
+
+sub process_request
+{
+    my $self = shift;
+    my $prop = $self->{server};
+    my ($device, $service);
+#    if ($prop->{udp_data} =~ /^(\d+\.\d+\.\d+\.\d+)\s+(\w+)$/) {
+    if ($prop->{udp_data} =~ /^([\w\d\.]+)\s+(\w+)$/) {
+        $device = $1;
+        $service = $2;
+        $prop->{client}->send($config->{"device"}->{$device}->{"service"}->{$service});
+    }
+    return;
+}
+

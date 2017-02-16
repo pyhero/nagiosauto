@@ -1,0 +1,494 @@
+#!/usr/bin/perl -w
+# nagios: +epn
+# check_host_static v 0.0.3 - Nagios(r) check host resource plugin
+# Copyright (c) 2004 Zhang Xiuling <xiulingzhang@sohu-inc.com>
+# 2004-11-19 12:33
+# rewrited by Huaping Huang <huapinghuang@sohu-inc.com>
+# 2008-12-05
+
+use strict;
+
+use Nagios::Plugin;
+use Net::SNMP qw(oid_base_match oid_lex_sort snmp_dispatcher);
+use FindBin qw($Bin);
+use lib "$Bin/../utils/";
+use MM::SNMP;
+use MM::RRD;
+use MM::XML;
+
+my $DIR_NAGIOS = "$Bin/..";
+my $DIR_TMP    = "$DIR_NAGIOS/RRDdb/tmp";
+my $CHK_ALIVE  = "/usr/sbin/fping -a";
+
+my ($crit_alarm, $warn_alarm);
+my ($message, $perfdata);
+
+# Thresholds definition
+my $warn_usage = 90;
+my $crit_usage = 99;
+my $warn_disk = 80;
+my $crit_disk = 90;
+my $warn_tcp_fails = 200;
+my $crit_tcp_fails = 300;
+my $warn_load5 = 20;
+my $crit_load5 = 50;
+my $warn_used_swap = 25;
+my $crit_used_swap = 60;
+my $warn_used_mem = 90;
+my $crit_used_mem = 93;
+
+my $np = Nagios::Plugin->new(
+    usage   => "Usage: %s [-H|--host=<host>]",
+    version => "0.0.3",
+);
+$np->add_arg(
+    spec     => "H|host=s",
+    help     => "Hostname or IP Address",
+    required => 1,
+);
+$np->getopts();
+
+my $device = $np->opts->H;
+
+# Check if the device is alive
+if (!`$CHK_ALIVE $device 2>/dev/null`) {
+    $np->nagios_exit(CRITICAL, "$device is unreachable.");
+}
+
+# Retrieve authkey/privkey for SNMPv3 authentication
+my $config = MM::XML::xmlRetrieveConfig($device, "snmpd");
+
+my $authkey = $config->{"authkey"};
+my $privkey = $config->{"privkey"};
+if (!defined($authkey) || !defined($privkey)) {
+    $np->nagios_exit(WARNING, "authkey/privkey not found in config XML.");
+}
+$warn_load5 = $config->{'warn-load'} || $warn_load5;
+$crit_load5 = $config->{'crit-load'} || $crit_load5;
+
+$warn_used_mem = $config->{'warn_used_mem'} || $warn_used_mem;
+$crit_used_mem = $config->{'crit_used_mem'} || $crit_used_mem;
+
+$warn_used_swap = $config->{'warn_used_swap'} || $warn_used_swap;
+$crit_used_swap = $config->{'crit_used_swap'} || $crit_used_swap;
+
+$warn_disk= $config->{'warn_disk'} || $warn_disk;
+$crit_disk= $config->{'crit_disk'} || $crit_disk;
+
+# Create an SNMP Session
+my ($session, $error) = MM::SNMP::snmpv3CreateSession($device, undef, $authkey, $privkey);
+
+if (!defined($session)) {
+    $np->nagios_exit(CRITICAL, $error);
+}
+
+# OID definitions
+# every scalar variable has a ".0" suffix
+# System
+my $oid_hrSystemUptime    = ".1.3.6.1.2.1.25.1.1.0";
+my $oid_hrSystemDate      = ".1.3.6.1.2.1.25.1.2.0";
+my $oid_hrSystemNumUsers  = ".1.3.6.1.2.1.25.1.5.0";
+
+# CPU
+my $oid_ssCpuRawUser      = ".1.3.6.1.4.1.2021.11.50.0";
+my $oid_ssCpuRawNice      = ".1.3.6.1.4.1.2021.11.51.0";
+my $oid_ssCpuRawSystem    = ".1.3.6.1.4.1.2021.11.52.0";
+my $oid_ssCpuRawIdle      = ".1.3.6.1.4.1.2021.11.53.0";
+my $oid_ssCpuRawWait      = ".1.3.6.1.4.1.2021.11.54.0";
+
+# Load Average (Table)
+my $oid_laTable = ".1.3.6.1.4.1.2021.10";
+my $oid_laLoad  = ".1.3.6.1.4.1.2021.10.1.3";
+
+# Memory
+my $oid_memTotalSwap = ".1.3.6.1.4.1.2021.4.3.0";
+my $oid_memAvailSwap = ".1.3.6.1.4.1.2021.4.4.0";
+my $oid_memTotalReal = ".1.3.6.1.4.1.2021.4.5.0";
+my $oid_memAvailReal = ".1.3.6.1.4.1.2021.4.6.0";
+my $oid_memBuffer    = ".1.3.6.1.4.1.2021.4.14.0";
+my $oid_memCached    = ".1.3.6.1.4.1.2021.4.15.0";
+
+# Storage (Table)
+my $oid_dskTable = ".1.3.6.1.4.1.2021.9";
+my $oid_dskIndex = ".1.3.6.1.4.1.2021.9.1.1";
+my $oid_dskPath  = ".1.3.6.1.4.1.2021.9.1.2";
+my $oid_dskTotal = ".1.3.6.1.4.1.2021.9.1.6";
+my $oid_dskAvail = ".1.3.6.1.4.1.2021.9.1.7";
+#my $oid_dskUsed  = ".1.3.6.1.4.1.2021.9.1.8";
+
+# TCP
+my $oid_tcpActiveOpens  = ".1.3.6.1.2.1.6.5.0";
+my $oid_tcpPassiveOpens = ".1.3.6.1.2.1.6.6.0";
+my $oid_tcpAttemptFails = ".1.3.6.1.2.1.6.7.0";
+my $oid_tcpEstabResets  = ".1.3.6.1.2.1.6.8.0";
+my $oid_tcpCurrEstab    = ".1.3.6.1.2.1.6.9.0";
+my $oid_tcpInSegs       = ".1.3.6.1.2.1.6.10.0";
+my $oid_tcpOutSegs      = ".1.3.6.1.2.1.6.11.0";
+my $oid_tcpRetransSegs  = ".1.3.6.1.2.1.6.12.0";
+my $oid_tcpInErrs       = ".1.3.6.1.2.1.6.14.0";
+my $oid_tcpOutRsts      = ".1.3.6.1.2.1.6.15.0";
+
+# Interfaces (Table)
+my $oid_ifTable       = ".1.3.6.1.2.1.2.2";
+my $oid_ifIndex       = ".1.3.6.1.2.1.2.2.1.1";
+my $oid_ifDescr       = ".1.3.6.1.2.1.2.2.1.2";
+my $oid_ifType        = ".1.3.6.1.2.1.2.2.1.3";
+my $oid_ifSpeed       = ".1.3.6.1.2.1.2.2.1.5";
+my $oid_ifPhysAddress = ".1.3.6.1.2.1.2.2.1.6";
+my $oid_ifOperStatus  = ".1.3.6.1.2.1.2.2.1.8";
+my $oid_ifInOctets    = ".1.3.6.1.2.1.2.2.1.10";
+my $oid_ifOutOctets   = ".1.3.6.1.2.1.2.2.1.16";
+my $oid_ifXTable      = ".1.3.6.1.2.1.31.1.1";
+my $oid_ifHCInOctets  = ".1.3.6.1.2.1.31.1.1.1.6";
+my $oid_ifHCOutOctets = ".1.3.6.1.2.1.31.1.1.1.10";
+
+# IPv4 (Table)
+my $oid_ipAddrTable = ".1.3.6.1.2.1.4.20";
+my $oid_ipAdEntAddr = ".1.3.6.1.2.1.4.20.1.1";
+my $oid_ipAdEntIfIndex = ".1.3.6.1.2.1.4.20.1.2";
+
+
+my @scalar_list;
+push( @scalar_list,
+      $oid_hrSystemUptime,
+      $oid_hrSystemDate,
+      $oid_hrSystemNumUsers,
+      $oid_ssCpuRawUser,
+      $oid_ssCpuRawNice,
+      $oid_ssCpuRawSystem,
+      $oid_ssCpuRawIdle,
+      $oid_ssCpuRawWait,
+      $oid_memTotalSwap,
+      $oid_memAvailSwap,
+      $oid_memTotalReal,
+      $oid_memAvailReal,
+      $oid_memBuffer,
+      $oid_memCached,
+      $oid_tcpActiveOpens,
+      $oid_tcpPassiveOpens,
+      $oid_tcpAttemptFails,
+      $oid_tcpEstabResets,
+      $oid_tcpCurrEstab,
+      $oid_tcpInSegs,
+      $oid_tcpOutSegs,
+      $oid_tcpRetransSegs,
+      $oid_tcpInErrs,
+      $oid_tcpOutRsts,
+);
+
+# Get...
+my ($res_scalar, $res_laTable, $res_dskTable, $res_ifTable, $res_ifXTable, $res_ipAddrTable);
+my $stat_scalar = MM::SNMP::snmpGetScalar($session, \$res_scalar, \@scalar_list);
+if (!defined($stat_scalar)) {
+    $error = $session->error();
+    $session->close();
+    $np->nagios_exit(CRITICAL, $error);
+}
+my $stat_laTable  = MM::SNMP::snmpGetTable($session, \$res_laTable,  $oid_laTable);
+if (!defined($stat_laTable)) {
+    $error = $session->error();
+    $session->close();
+    $np->nagios_exit(CRITICAL, $error);
+}
+my $stat_dskTable = MM::SNMP::snmpGetTable($session, \$res_dskTable, $oid_dskTable);
+if (!defined($stat_dskTable)) {
+    $error = $session->error();
+    $session->close();
+    $np->nagios_exit(CRITICAL, $error);
+}
+my $stat_ifTable  = MM::SNMP::snmpGetTable($session, \$res_ifTable,  $oid_ifTable);
+if (!defined($stat_ifTable)) {
+    $error = $session->error();
+    $session->close();
+    $np->nagios_exit(CRITICAL, $error);
+}
+my $stat_ifXTable = MM::SNMP::snmpGetTable($session, \$res_ifXTable, $oid_ifXTable);
+if (!defined($stat_ifXTable)) {
+    $error = $session->error();
+    $session->close();
+    $np->nagios_exit(CRITICAL, $error);
+}
+my $stat_ipAddrTable = MM::SNMP::snmpGetTable($session, \$res_ipAddrTable, $oid_ipAddrTable);
+if (!defined($stat_ipAddrTable)) {
+    $error = $session->error();
+    $session->close();
+    $np->nagios_exit(CRITICAL, $error);
+}
+snmp_dispatcher();
+if (!defined($res_scalar) || !defined($res_laTable) || !defined($res_ifTable) || !defined($res_ipAddrTable)) {
+    $error = $session->error();
+    $session->close();
+    $np->nagios_exit(CRITICAL, $error);
+}
+if (!defined($res_dskTable)) {
+    $error = $session->error();
+    $session->close();
+    $np->nagios_exit(WARNING, "dskTable undefined" . $error);
+}
+$session->close();
+&data_processing();
+
+if ($crit_alarm) {
+    $np->nagios_exit(CRITICAL, "$message\n|$perfdata");
+}
+if ($warn_alarm) {
+    $np->nagios_exit(WARNING, "$message\n|$perfdata");
+}
+$np->nagios_exit(OK, "$message\n|$perfdata");
+
+# main end
+
+sub data_processing
+{
+    # Check Ip Alive
+    foreach my $oid (oid_lex_sort(keys(%{$res_ipAddrTable}))) {
+        if (!oid_base_match($oid_ipAdEntAddr, $oid)) {
+            last;
+        }
+        if (ip_is_public($res_ipAddrTable->{$oid})) {
+            if (!`$CHK_ALIVE $res_ipAddrTable->{$oid} 2>/dev/null`) {
+                $crit_alarm = 1;
+                $message .= "[$res_ipAddrTable->{$oid} DOWN]";
+            } else {
+                $message .= " $res_ipAddrTable->{$oid} UP,";
+            }
+        }
+    }
+
+    # User, Process, CPU, Load, Memory, TCP ...
+    $message  .= "Host: up " . $res_scalar->{$oid_hrSystemUptime}
+               . " (" . MM::SNMP::snmpDate2String($res_scalar->{$oid_hrSystemDate}) . ") ";
+    my $load5 = $res_laTable->{$oid_laLoad . ".2"};
+    if ($load5 >= $crit_load5) {
+        $crit_alarm = 1;
+        $message .= '[';
+    } elsif ($load5 >= $warn_load5) {
+        $warn_alarm = 1;
+        $message .= '(';
+    }
+    $message  .= "Load: " . $res_laTable->{$oid_laLoad . ".1"} . ", " . $res_laTable->{$oid_laLoad . ".2"} . ", "
+               . $res_laTable->{$oid_laLoad . ".3"};
+    if ($crit_alarm) {
+        $message .= ']';
+    } elsif ($warn_alarm) {
+        $message .= ')';
+    }
+    $perfdata .= "check_host_static::check_host_static::hrSystemNumUsers=" . $res_scalar->{$oid_hrSystemNumUsers} . " "
+               . "ssCpuRawUser=" . $res_scalar->{$oid_ssCpuRawUser} . "c;;;0;" . " "
+               . "ssCpuRawNice=" . $res_scalar->{$oid_ssCpuRawNice} . "c;;;0;" . " "
+               . "ssCpuRawSystem=" . $res_scalar->{$oid_ssCpuRawSystem} . "c;;;0;" . " "
+               . "ssCpuRawIdle=" . $res_scalar->{$oid_ssCpuRawIdle} . "c;;;0;" . " "
+               . "ssCpuRawWait=" . $res_scalar->{$oid_ssCpuRawWait} . "c;;;0;" . " "
+               . "laLoad1=" . $res_laTable->{$oid_laLoad . ".1"} . " "
+               . "laLoad5=" . $res_laTable->{$oid_laLoad . ".2"} . " "
+               . "laLoad15=" . $res_laTable->{$oid_laLoad . ".3"} . " "
+               . "memTotalSwap=" . $res_scalar->{$oid_memTotalSwap} . " "
+               . "memAvailSwap=" . $res_scalar->{$oid_memAvailSwap} . " "
+               . "memTotalReal=" . $res_scalar->{$oid_memTotalReal} . " "
+               . "memAvailReal=" . $res_scalar->{$oid_memAvailReal} . " "
+               . "memBuffer=" . $res_scalar->{$oid_memBuffer} . " "
+               . "memCached=" . $res_scalar->{$oid_memCached} . " "
+               . "tcpActiveOpens=" . $res_scalar->{$oid_tcpActiveOpens} . "c;;;0;" . " "
+               . "tcpPassiveOpens=" . $res_scalar->{$oid_tcpPassiveOpens} . "c;;;0;" . " "
+               . "tcpAttemptFails=" . $res_scalar->{$oid_tcpAttemptFails} . "c;;;0;" . " "
+               . "tcpEstabResets=" . $res_scalar->{$oid_tcpEstabResets} . "c;;;0;" . " "
+               . "tcpCurrEstab=" . $res_scalar->{$oid_tcpCurrEstab} . " "
+               . "tcpInSegs=" . $res_scalar->{$oid_tcpInSegs} . "c;;;0;" . " "
+               . "tcpOutSegs=" . $res_scalar->{$oid_tcpOutSegs} . "c;;;0;" . " "
+               . "tcpRetransSegs=" . $res_scalar->{$oid_tcpRetransSegs} . "c;;;0;" . " "
+               . "tcpInErrs=" . $res_scalar->{$oid_tcpInErrs} . "c;;;0;" . " "
+               . "tcpOutRsts=" . $res_scalar->{$oid_tcpOutRsts} . "c;;;0;" . " ";
+    my $lastFails = MM::RRD::RRDgetLast($DIR_TMP, $device, "tcp", "tcpAttemptFails", time(), $res_scalar->{$oid_tcpAttemptFails});
+    $lastFails = 0 if ($lastFails eq "UNKN");
+    if ($lastFails > $crit_tcp_fails) {
+        $crit_alarm = 1;
+        $message .= " [tcpAttemptFails: " . sprintf("%.2f", $lastFails) . "/s]";
+    } elsif ($lastFails > $warn_tcp_fails) {
+        $warn_alarm = 1;
+        $message .= " (tcpAttemptFails: " . sprintf("%.2f", $lastFails) . "/s)";
+    }
+
+    # Real Memory
+    my $memTotalReal = $res_scalar->{$oid_memTotalReal};
+    my $memAvailReal = $res_scalar->{$oid_memAvailReal};
+    my $memBuffer = $res_scalar->{$oid_memBuffer};
+    my $memCached = $res_scalar->{$oid_memCached};
+    my $memUsedPercent = 100 - ($memAvailReal + $memBuffer + $memCached)/$memTotalReal * 100;
+    if ($memUsedPercent > $crit_used_mem) {
+        $crit_alarm = 1;
+        $message .= " [MemUse: " . sprintf("%.0f", $memUsedPercent) . "%]";
+    } elsif ($memUsedPercent > $warn_used_mem) {
+        $warn_alarm = 1;
+        $message .= " (MemUse: " . sprintf("%.0f", $memUsedPercent) . "%)";
+    }
+
+
+    # Swap
+    my $memTotalSwap = $res_scalar->{$oid_memTotalSwap};
+    my $memAvailSwap = $res_scalar->{$oid_memAvailSwap};
+    if ($memAvailSwap > 0) {
+        my $memFreeSwap = 100 - $memAvailSwap/$memTotalSwap * 100;
+        if ($memFreeSwap > $crit_used_swap) {
+            $crit_alarm = 1;
+            $message .= " [SwapUse: " . sprintf("%.0f", $memFreeSwap) . "%]";
+	} elsif ($memFreeSwap > $warn_used_swap) {
+            $warn_alarm = 1;
+            $message .= " (SwapUse: " . sprintf("%.0f", $memFreeSwap) . "%)";
+        }
+    }
+
+    # disks
+    # traverse the table index, which is always at the beginning at the sorted table
+    foreach my $oid (oid_lex_sort(keys(%{$res_dskTable}))) {
+        if (!oid_base_match($oid_dskIndex, $oid)) {
+            last;
+        }
+        my $dskPath = $res_dskTable->{$oid_dskPath . "." . $res_dskTable->{$oid}};
+        my $dskTotal = $res_dskTable->{$oid_dskTotal . "." . $res_dskTable->{$oid}};
+        # dirty fix here, for smooth upgrading
+        my $dskUsed  = $dskTotal - $res_dskTable->{$oid_dskAvail . "." . $res_dskTable->{$oid}};
+        my $dskPercent = $dskTotal ? $dskUsed / $dskTotal * 100 : 0;
+        if ($dskPercent > $crit_disk) {
+            $crit_alarm = 1;
+            $message .= " [" . $dskPath . ": " . sprintf("%.2f%% ", $dskPercent) . "used]";
+        } elsif ($dskPercent > $warn_disk) {
+            $warn_alarm = 1;
+            $message .= " (" . $dskPath . ": " . sprintf("%.2f%% ", $dskPercent) . "used)";
+        }
+        # for pnp compatible
+        $dskPath =~ s/\//_/g;
+        $perfdata .= "Disk-" . $dskPath . "::hoststatic_disks::dskTotal=" . $dskTotal . " "
+                   . "dskUsed=" . $dskUsed . " ";
+    }
+    # fetch the relationship between ip and if
+    my $ip2if;
+    foreach my $oid (oid_lex_sort(keys(%{$res_ipAddrTable}))) {
+        if (!oid_base_match($oid_ipAdEntAddr, $oid)) {
+            last;
+        }
+        $ip2if->{$res_ipAddrTable->{$oid}} = $res_ipAddrTable->{$oid_ipAdEntIfIndex . "." . $res_ipAddrTable->{$oid}};
+    }
+    # interfaces
+    $message .= " Traffic";
+
+    my @info;
+    # traverse the table index, which is always at the beginning at the sorted table
+    foreach my $oid (oid_lex_sort(keys(%{$res_ifTable}))) {
+        if (!oid_base_match($oid_ifIndex, $oid)) {
+            last;
+        }
+        # ifType: ethernetCsmacd(6) iso88023Csmacd(7) propVirtual(53) gigabitEthernet(117) other(1)
+        # ifOperStatus: up(1)
+	my $ifType = $res_ifTable->{$oid_ifType . "." . $res_ifTable->{$oid}};
+        if ( (($ifType == 6) || ($ifType == 7) || ($ifType == 53) || ($ifType == 117) || ($ifType == 1))
+            && ($res_ifTable->{$oid_ifOperStatus . "." . $res_ifTable->{$oid}} == 1) )
+        {
+            my $ifDescr       = $res_ifTable->{$oid_ifDescr . "." . $res_ifTable->{$oid}};
+            my $ifPhysAddress = $res_ifTable->{$oid_ifPhysAddress . "." . $res_ifTable->{$oid}};
+            my $ifSpeed = $res_ifTable->{$oid_ifSpeed . "." . $res_ifTable->{$oid}};
+            my $cursor; $cursor->{ifDescr} = $ifDescr; $cursor->{ifPhysAddress} = $ifPhysAddress; $cursor->{ifSpeed} = $ifSpeed;
+            push (@info, $cursor);
+            # ignore ifaces without ip except pethX and ethX
+            if ((grep(/^$res_ifTable->{$oid}$/, values(%{$ip2if})) == 0) && ($ifDescr !~ /^p?eth\d+$/)) {
+                next;
+            }
+            # correct the ifSpeed for bonds, VLANs and xen ...2
+            if ($ifDescr =~ /^bond\d+$/) {
+                $ifSpeed = 0;
+                foreach $cursor (@info) {
+                    if ($ifDescr ne $cursor->{ifDescr} && $ifPhysAddress eq $cursor->{ifPhysAddress}) {
+                        $ifSpeed += $cursor->{ifSpeed};
+                    }
+                }
+            } elsif (($ifDescr =~ /^eth\d+\.\d+$/) || ($ifDescr =~ /^vlan\d+$/)) {
+                foreach $cursor (@info) {
+                    if ($ifDescr ne $cursor->{ifDescr} && $cursor->{ifDescr} !~ /eth\d+\.\d+/ && $cursor->{ifDescr} !~ /vlan\d+/ && $ifPhysAddress eq $cursor->{ifPhysAddress}) {
+                        $ifSpeed = $cursor->{ifSpeed};
+                        last;
+                    }
+                }
+            # today, no 10M ifaces!
+            } elsif ($ifSpeed == 10000000) {
+                $ifSpeed = 0;
+            }
+
+            my $ifInOctets  = defined($res_ifXTable) ? $res_ifXTable->{$oid_ifHCInOctets . "." . $res_ifTable->{$oid}} : $res_ifTable->{$oid_ifInOctets . "." . $res_ifTable->{$oid}};
+            my $ifOutOctets = defined($res_ifXTable) ? $res_ifXTable->{$oid_ifHCOutOctets . "." . $res_ifTable->{$oid}} : $res_ifTable->{$oid_ifOutOctets . "." . $res_ifTable->{$oid}};
+            my $time        = time();
+            my $lastIn      = MM::RRD::RRDgetLast($DIR_TMP, $device, "Ifaces-$ifDescr", "ifInOctets", $time, $ifInOctets);
+            $lastIn = 0 if ($lastIn eq "UNKN");
+            my $lastOut     = MM::RRD::RRDgetLast($DIR_TMP, $device, "Ifaces-$ifDescr", "ifOutOctets", $time, $ifOutOctets);
+            $lastOut = 0 if ($lastOut eq "UNKN");
+            my $inPercent   = sprintf("%.2f", $ifSpeed ? $lastIn / ($ifSpeed / 800) : 0);
+            my $outPercent  = sprintf("%.2f", $ifSpeed ? $lastOut / ($ifSpeed / 800) : 0);
+            my ($inSpeed, $outSpeed);
+
+            # provide more human readability
+            if (($lastIn / 10**6) > 1) {
+                $inSpeed = sprintf("%.2fMB/s ", $lastIn / 10**6);
+            } elsif (($lastIn / 10**3) > 1) {
+                $inSpeed = sprintf("%.2fKB/s ", $lastIn / 10**3);
+            } else {
+                $inSpeed = sprintf("%.2fB/s ", $lastIn);
+            }
+            if (($lastOut / 10**6) > 1) {
+                $outSpeed = sprintf("%.2fMB/s ", $lastOut / 10**6);
+            } elsif (($lastIn / 10**3) > 1) {
+                $outSpeed = sprintf("%.2fKB/s ", $lastOut / 10**3);
+            } else {
+                $outSpeed = sprintf("%.2fB/s ", $lastOut);
+            }
+            if ($ifDescr !~ /^eth\d+\.\d+/) {
+                $message .= " " . $ifDescr;
+                if (!$ifSpeed) {
+                    $message .= " IN: " . $inSpeed . " OUT: " . $outSpeed;
+                } else {
+                    if ($inPercent > $crit_usage) {
+                        $crit_alarm = 1;
+                        $message .= " [IN: " . $inSpeed . $inPercent . "%]";
+                    } elsif ($inPercent > $warn_usage) {
+                        $warn_alarm = 1;
+                        $message .= " (IN: " . $inSpeed . $inPercent . "%)";
+                    } else {
+                        $message .= " IN: " . $inSpeed . $inPercent . "%";
+                    }
+                    if ($outPercent > $crit_usage) {
+                        $crit_alarm = 1;
+                        $message .= " [OUT: " . $outSpeed . $outPercent . "%]";
+                    } elsif ($outPercent > $warn_usage) {
+                        $warn_alarm = 1;
+                        $message .= " (OUT: " . $outSpeed . $outPercent . "%)";
+                    } else {
+                        $message .= " OUT: " . $outSpeed . $outPercent . "%";
+                    }
+                }
+            }
+            if (!$ifSpeed) {
+                $perfdata .= "Iface-" . $ifDescr . "::hoststatic_ifaces::ifInOctets=" . $ifInOctets . "c;;;0;" . " "
+                           . "ifOutOctets=" . $ifOutOctets . "c;;;0;" . " ";
+            } else {
+                $perfdata .= "Iface-" . $ifDescr . "::hoststatic_ifaces::ifInOctets=" . $ifInOctets . "c;;;0;" . $ifSpeed . " "
+                           . "ifOutOctets=" . $ifOutOctets . "c;;;0;" . $ifSpeed . " ";
+            }
+        }
+    }
+}
+
+# (127.0.0.0/8, 10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/12)
+# return: 0 if ip is private
+#         1 if ip is public
+sub ip_is_public
+{
+    my @sec = split(/\./, $_[0]);
+    if (($sec[0] == 10) || ($sec[0] == 127)) {
+        return 0;
+    } elsif (($sec[0] == 192) && ($sec[1] == 168)) {
+        return 0;
+    } elsif ($sec[0] == 172) {
+        if (($sec[1] >= 16) && ($sec[1] < 32)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+

@@ -1,0 +1,219 @@
+#!/usr/bin/perl -w
+# nagios: +epn
+# check_squid2 v 0.2.0 - Nagios(r) SQUID2 monitor plugin
+#
+# Copyright (c) 2004 Zhang Xiuling <xiulingzhang@sohu-inc.com>
+# Copyright (c) 2004 Jesse <jesseyao@sohu-inc.com>
+# rewrited by Huaping Huang <huapinghuang@sohu-inc.com>
+# 2009-07-06
+
+use strict;
+
+use Nagios::Plugin;
+use Net::SNMP qw(oid_base_match oid_lex_sort snmp_dispatcher);
+use FindBin qw($Bin);
+use lib "$Bin/../utils/";
+use MM::SNMP;
+use MM::RRD;
+use MM::XML;
+use Time::Period;
+
+my $DIR_NAGIOS = "$Bin/../";
+my $DIR_TMP    = "$DIR_NAGIOS/RRDdb/tmp";
+my $CHK_ALIVE  = "/usr/sbin/fping -a";
+
+my ($crit_alarm, $warn_alarm);
+my ($message, $perfdata);
+
+# Thresholds definition
+
+my $warn_request_hit_ratio = 0;
+my $crit_request_hit_ratio = 0;
+my $warn_byte_hit_ratio = 0;
+my $crit_byte_hit_ratio = 0;
+my $warn_cpu_usage = 95;
+my $crit_cpu_usage = 98;
+my $warn_requests = 3000;
+my $crit_requests = 4000;
+my $warn_traffic = 25 * 1024;
+my $crit_traffic = 50 * 1024;
+my $hit_ratio_ignored_timeframe = "hour {0am-8am}";
+
+print "<IMG SRC='/nagios/images/logos/base/squid40.gif' BORDER=0 WIDTH=20 HEIGHT=20 ALT='Squid'> ";
+
+my $np = Nagios::Plugin->new(
+    usage   => "Usage: %s [-H|--host=<host>]",
+    version => "0.2.0",
+);
+$np->add_arg(
+    spec     => "H|host=s",
+    help     => "Hostname or IP Address",
+    required => 1,
+);
+$np->getopts();
+
+my $device = $np->opts->H;
+
+# Retrieve community and params for SNMPv1/2c authentication
+my $config = MM::XML::xmlRetrieveConfig($device, "squid");
+
+my $fpingflag = $config->{'fping'};
+
+# Check if the device is alive
+if (!(defined($fpingflag) && $fpingflag == 0) && !`$CHK_ALIVE $device 2>/dev/null`) {
+    $np->nagios_exit(CRITICAL, "$device is unreachable.");
+}
+
+$warn_request_hit_ratio = $config->{'warn-request-hit-ratio'} || $warn_request_hit_ratio;
+$crit_request_hit_ratio = $config->{'crit-request-hit-ratio'} || $crit_request_hit_ratio;
+$warn_byte_hit_ratio = $config->{'warn-byte-hit-ratio'} || $warn_byte_hit_ratio;
+$crit_byte_hit_ratio = $config->{'crit-byte-hit-ratio'} || $crit_byte_hit_ratio;
+$warn_cpu_usage = $config->{'warn-cpu-usage'} || $warn_cpu_usage;
+$crit_cpu_usage = $config->{'crit-cpu-usage'} || $crit_cpu_usage;
+$warn_requests = $config->{'warn-requests'} || $warn_requests;
+$crit_requests = $config->{'crit-requests'} || $crit_requests;
+$warn_traffic = $config->{'warn-traffic'} || $warn_traffic;
+$crit_traffic = $config->{'crit-traffic'} || $crit_traffic;
+
+$hit_ratio_ignored_timeframe = $config->{'hit-ratio-ignored-timeframe'} || $hit_ratio_ignored_timeframe;
+my $port = $config->{'port'} || 3402;
+
+my ($session, $error) = MM::SNMP::squidsnmpCreateSession($device, $config->{'read-community'}, $port, $config->{'version'});
+if (!defined($session)) {
+    $np->nagios_exit(CRITICAL, $error);
+}
+
+# OID definitions
+# every scalar variable has a ".0" suffix
+my $oid_cacheSysVMsize = ".1.3.6.1.4.1.3495.1.1.1.0";
+my $oid_cacheUptime = ".1.3.6.1.4.1.3495.1.1.3.0";
+my $oid_cacheCpuTime = ".1.3.6.1.4.1.3495.1.3.1.4.0";
+my $oid_cacheNumObjCount = ".1.3.6.1.4.1.3495.1.3.1.7.0";
+my $oid_cacheCurrentUnlinkRequests = ".1.3.6.1.4.1.3495.1.3.1.9.0";
+my $oid_cacheProtoClientHttpRequests = ".1.3.6.1.4.1.3495.1.3.2.1.1.0";
+my $oid_cacheHttpHits = ".1.3.6.1.4.1.3495.1.3.2.1.2.0";
+my $oid_cacheHttpOutKb = ".1.3.6.1.4.1.3495.1.3.2.1.5.0";
+my $oid_cacheServerRequests = ".1.3.6.1.4.1.3495.1.3.2.1.10.0";
+my $oid_cacheServerInKb = ".1.3.6.1.4.1.3495.1.3.2.1.12.0";
+    
+my @scalar_list;
+push(@scalar_list,
+     $oid_cacheSysVMsize,
+     $oid_cacheUptime,
+     $oid_cacheCpuTime,
+     $oid_cacheNumObjCount,
+     $oid_cacheCurrentUnlinkRequests,
+     $oid_cacheProtoClientHttpRequests,
+     $oid_cacheHttpHits,
+     $oid_cacheHttpOutKb,
+     $oid_cacheServerRequests,
+     $oid_cacheServerInKb,
+);
+
+# Get...
+my $res_scalar;
+my $stat_scalar = MM::SNMP::snmpGetScalar($session, \$res_scalar, \@scalar_list);
+
+if (!defined($stat_scalar)) {
+    $np->nagios_exit(CRITICAL, $session->error());
+}
+snmp_dispatcher();
+if (!defined($res_scalar)) {
+    $np->nagios_exit(CRITICAL, $session->error());
+}
+$session->close();
+&data_processing();
+if ($crit_alarm) {
+    $np->nagios_exit(CRITICAL, "$message\n|$perfdata");
+}
+if ($warn_alarm) {
+    $np->nagios_exit(WARNING, "$message\n|$perfdata");
+}
+$np->nagios_exit(OK, "$message\n|$perfdata");
+
+# main end
+
+sub data_processing
+{
+    my $time = time();
+    my $lastHttpHits = MM::RRD::RRDgetLast($DIR_TMP, $device, "squid2", "HttpHits", $time, $res_scalar->{$oid_cacheHttpHits});
+    my $lastCliReqs = MM::RRD::RRDgetLast($DIR_TMP, $device, "squid2", "ClientReqs", $time, $res_scalar->{$oid_cacheProtoClientHttpRequests});
+    my $lastHttpOutKb = MM::RRD::RRDgetLast($DIR_TMP, $device, "squid2", "HttpOutKb", $time, $res_scalar->{$oid_cacheHttpOutKb});
+    my $lastServerInKb = MM::RRD::RRDgetLast($DIR_TMP, $device, "squid2", "ServerInKb", $time, $res_scalar->{$oid_cacheServerInKb});
+    my $lastCpuTime = MM::RRD::RRDgetLast($DIR_TMP, $device, "squid2", "CpuTime", $time, $res_scalar->{$oid_cacheCpuTime});
+    $lastHttpHits = 0 if ($lastHttpHits eq "UNKN");
+    $lastCliReqs = 0 if ($lastCliReqs eq "UNKN");
+    $lastHttpOutKb = 0 if ($lastHttpOutKb eq "UNKN");
+    $lastServerInKb = 0 if ($lastServerInKb eq "UNKN");
+    $lastCpuTime = 0 if ($lastCpuTime eq "UNKN");
+    my ($RHR, $BHR);
+    if ($lastCliReqs != 0) {
+        $RHR = sprintf("%.3f", $lastHttpHits / $lastCliReqs * 100);
+    } else {
+        $RHR = "UNKN";
+    }
+    if ($lastHttpOutKb != 0) {
+        $BHR = sprintf("%.3f", ($lastHttpOutKb - $lastServerInKb) / $lastHttpOutKb * 100);
+    } else {
+        $BHR = "UNKN";
+    }
+    if ($RHR ne "UNKN" && $RHR > 0 && $RHR < $crit_request_hit_ratio && !inPeriod($time, $hit_ratio_ignored_timeframe)) {
+        $crit_alarm = 1;
+        $message .= "[RHR: $RHR%] ";
+    } elsif ($RHR ne "UNKN" && $RHR > 0 && $RHR < $warn_request_hit_ratio && !inPeriod($time, $hit_ratio_ignored_timeframe)) {
+        $warn_alarm = 1;
+        $message .= "(RHR: $RHR%) ";
+    } else {
+        $message .= "RHR: $RHR% ";
+    }
+
+    if ($BHR ne "UNKN" && $BHR > 0 && $BHR < $crit_byte_hit_ratio && !inPeriod($time, $hit_ratio_ignored_timeframe)) {
+        $crit_alarm = 1;
+        $message .= "[BHR: $BHR%] ";
+    } elsif ($BHR ne "UNKN" && $BHR < $warn_byte_hit_ratio && !inPeriod($time, $hit_ratio_ignored_timeframe)) {
+        $warn_alarm = 1;
+        $message .= "(BHR: $BHR%) ";
+    } else {
+        $message .= "BHR: $BHR% ";
+    }
+    if ($lastHttpOutKb > $crit_traffic) {
+        $crit_alarm = 1;
+        $message .= "[TF: " . sprintf("%.3f", $lastHttpOutKb) . "KB/s] ";
+    } elsif ($lastHttpOutKb > $warn_traffic) {
+        $warn_alarm = 1;
+        $message .= "(TF: " . sprintf("%.3f", $lastHttpOutKb) . "KB/s) ";
+    } else {
+        $message .= "TF: " . sprintf("%.3f", $lastHttpOutKb) . "KB/s ";
+    }
+
+    if ($lastCliReqs > $crit_requests) {
+        $crit_alarm = 1;
+        $message .= "[RQ: " . sprintf("%.2f", $lastCliReqs) . "/s] ";
+    } elsif ($lastCliReqs > $warn_requests) {
+        $warn_alarm = 1;
+        $message .= "(RQ: " . sprintf("%.2f", $lastCliReqs) . "/s) ";
+    } else {
+        $message .= "RQ: " . sprintf("%.2f", $lastCliReqs) . "/s ";
+    }
+
+    my $CpuUsage = sprintf("%.1f", $lastCpuTime * 100);
+    if ($CpuUsage > $crit_cpu_usage) {
+        $crit_alarm = 1;
+        $message .= "[CPU: $CpuUsage%] ";
+    } elsif ($CpuUsage > $warn_cpu_usage) {
+        $warn_alarm = 1;
+        $message .= "(CPU: $CpuUsage%) ";
+    } else {
+        $message .= "CPU: $CpuUsage% ";
+    }
+
+    $perfdata .= "check_squid2::check_squid::SysVMsize=" . $res_scalar->{$oid_cacheSysVMsize} . " "
+               . "CpuTime=" . $res_scalar->{$oid_cacheCpuTime} . " "
+               . "NumObjCount=" . $res_scalar->{$oid_cacheNumObjCount} . " "
+               . "CurrUnlinkReqs=" . $res_scalar->{$oid_cacheCurrentUnlinkRequests} . " "
+               . "ClientReqs=" . $res_scalar->{$oid_cacheProtoClientHttpRequests} . " "
+               . "HttpHits=" . $res_scalar->{$oid_cacheHttpHits} . " "
+               . "HttpOutKb=" . $res_scalar->{$oid_cacheHttpOutKb} . " "
+               . "ServerReqs=" . $res_scalar->{$oid_cacheServerRequests} . " "
+               . "ServerInKb=" . $res_scalar->{$oid_cacheServerInKb} . " \n";
+}
